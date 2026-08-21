@@ -349,15 +349,17 @@ mod tests {
     }
 
     #[test]
-    fn min_notional_skips_dust_trades() {
-        let strat = small_cfg();
-        let cs: Vec<Candle> = std::iter::repeat(candle(0, 100.0, 100.0))
-            .take(90)
-            .collect();
-        // flat series never signals anyway; force via tiny risk so IF a signal
-        // appeared it'd be skipped — assert engine invariant instead:
-        let out = run(&cs, &strat, &bt_cfg(200.0, 0.01));
+    fn min_notional_skips_dust_signal_but_control_records_trade() {
+        // Same valid signal (one_signal_series), two equity levels:
+        // $20 equity -> notional cap binds at half equity = $10 < $15 floor,
+        // so the position must be skipped entirely.
+        let out = run(&one_signal_series(), &exact_strat(), &bt_cfg(20.0, 2.0));
         assert!(out.trades.is_empty());
-        assert!((out.final_equity - 200.0).abs() < 1e-9);
+        assert!((out.final_equity - 20.0).abs() < 1e-9);
+
+        // Control: $40 equity lifts the cap to $20 >= $15 -> the identical
+        // signal books its trade.
+        let ctrl = run(&one_signal_series(), &exact_strat(), &bt_cfg(40.0, 2.0));
+        assert_eq!(ctrl.trades.len(), 1);
     }
 }
