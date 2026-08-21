@@ -3,6 +3,7 @@ mod db;
 mod exchange;
 mod indicators;
 mod metrics;
+mod signed;
 mod strategy;
 mod types;
 
