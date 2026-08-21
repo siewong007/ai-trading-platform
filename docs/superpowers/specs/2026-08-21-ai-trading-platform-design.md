@@ -50,7 +50,7 @@ Single Rust binary using Tokio. SQLite storage. Axum web server. One project fol
    - Daily loss limit −3% → flatten all positions, halt until manual reset
    - Binance min-notional and lot-size compliance
    - Refusal to act on stale data (> 2 missed candles)
-4. **ai_overlay/** — Scheduled (every 30 min) news/sentiment fetch for watched assets → LLM scores bias per asset on −1.0…+1.0 with one-line rationale. Policy:
+4. **ai_overlay/** — Scheduled (every 30 min) news/sentiment fetch for watched assets → LLM scores bias per asset on −1.0…+1.0 with one-line rationale. LLM provider is configurable (any OpenAI-compatible endpoint). Policy:
    - bias < −0.5 → block new longs in that asset
    - −0.5 ≤ bias < 0 → halve position size
    - positive bias never creates a trade
