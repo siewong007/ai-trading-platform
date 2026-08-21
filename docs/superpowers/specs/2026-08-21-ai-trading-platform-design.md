@@ -1,99 +1,149 @@
-# AI Trading Platform — Design Spec
+# AI Trading Platform — Design Spec (rev 2)
 
-**Date:** 2026-08-21
-**Status:** Approved by user (pending final review)
+**Date:** 2026-08-21 (rev 2 same day, post-review)
+**Status:** Revised after external review; pending user re-approval
+**Review acknowledgment:** Rev 1's risk model was arithmetically incoherent at the stated capital range, the AI overlay was negative-EV at this tier, and the parts determining profitability got less design attention than infrastructure. This revision fixes those. Full critique preserved in git history (rev 1 commit `f2688fe`).
 
 ## 1. Goal
 
-A personal AI-assisted crypto swing-trading platform that trades real money on Binance, runs 24/7 on the user's Mac, and is operated with full AI (assistant) support. Income is a goal, not a guarantee: the system is designed around strict risk controls so losing days are bounded.
+A personal crypto swing-trading platform trading real money on Binance, running 24/7 on the user's Mac, operated with AI-assistant support.
+
+**Framing:** The first live deployment ($100–300) is *tuition*, not capital. The honest base rate for retail algo trading is that most systems lose to fees over a full cycle. The design goal is bounded downside while we find out whether there is any edge — not promised income.
 
 ## 2. Decisions Made
 
 | Decision | Choice |
 |---|---|
-| Market | Binance crypto, spot only, 6–10 liquid pairs (BTC, ETH, SOL, …) |
-| Style | Swing trading — decisions on 1h/4h candle closes |
-| Capital | $100–$1,000 starting range; begin at low end |
-| Execution | Real money from day one, behind hard risk rails |
-| AI role | Rules-based core generates signals; LLM overlay may only veto or downsize |
-| Language | Rust (user's explicit choice despite speed being non-critical) |
-| Hosting | User's Mac, 24/7 (sleep disabled) |
-| Interface | Web dashboard + Telegram alerts |
+| Market | Binance spot, liquid USDT pairs (test set of 5 for validation; trade subset that passes) |
+| Style | Swing — decisions on 1h candle closes |
+| Capital | $100–300 at go-live (tuition sizing); risk model scales coherently above $500 |
+| AI overlay | **Deferred out of v1.** Revisit at ≥$3k capital with counterfactual logging (§9) |
+| Language | Rust (user choice, confirmed twice). Mitigation for slow research iteration: strategies are TOML configs interpreted by the binary — variants need no recompile; backtest/live share exact code paths |
+| Hosting | Mac 24/7, sleep disabled, launchd auto-restart, heartbeat monitoring |
+| Interface | Telegram alerts from day one; web dashboard ships before go-live |
 
 ## 3. Architecture
 
-Single Rust binary using Tokio. SQLite storage. Axum web server. One project folder, one command to run (`cargo run --release`), one `.env` for secrets.
+Single Rust binary, Tokio async runtime, SQLite (`sqlx`), Axum web server, direct Binance REST/WebSocket client (`reqwest` + `tokio-tungstenite`, HMAC-SHA256 signing).
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  TRADING ENGINE                 │
-│                                                 │
-│  Market Data ──▶ Strategy Engine ──▶ Risk Mgr   │
-│  (REST+WS)       (signals)         (veto/sizing)│
-│                                        │        │
-│                                        ▼        │
-│                                   Executor ────▶│ Binance
-│                                        │        │
-│                                   SQLite DB      │
-└──────────────┬──────────────────────────────────┘
-               ▼
-   Axum Dashboard (:8080) + Telegram Alerts
+┌──────────────────────────────────────────────────────┐
+│                   TRADING ENGINE                     │
+│                                                      │
+│  Market Data ──▶ Strategy Engine ──▶ Risk Manager    │
+│  (REST+WS)       (TOML-defined      (veto + sizing)  │
+│                   strategies)             │          │
+│                                           ▼          │
+│                            Executor ────────────────▶│ Binance
+│                                │                     │
+│                             SQLite DB               │
+└───────────────┬──────────────────────────────────────┘
+                ▼
+    Axum Dashboard (:8080, localhost+token)
+    Telegram Alerts + Hourly Heartbeat
 ```
 
-### Modules
+### Modules (v1)
 
-1. **exchange/** — Binance client. Signed REST (orders, balances, klines) via `reqwest`; live candles via WebSocket (`tokio-tungstenite`). HMAC-SHA256 request signing, rate-limit tracking, retry with exponential backoff.
-2. **strategy/** — Trait-based pluggable engine. Launch strategy: EMA trend filter + RSI pullback entries, ATR-based stop-loss and take-profit. Emits raw signals on candle close.
-3. **risk/** — Hard guardrails (non-overridable):
-   - Risk per trade ≤ 1% of equity
-   - Max 3 concurrent open positions
-   - Daily loss limit −3% → flatten all positions, halt until manual reset
-   - Binance min-notional and lot-size compliance
-   - Refusal to act on stale data (> 2 missed candles)
-4. **ai_overlay/** — Scheduled (every 30 min) news/sentiment fetch for watched assets → LLM scores bias per asset on −1.0…+1.0 with one-line rationale. LLM provider is configurable (any OpenAI-compatible endpoint). Policy:
-   - bias < −0.5 → block new longs in that asset
-   - −0.5 ≤ bias < 0 → halve position size
-   - positive bias never creates a trade
-   - Cost target: ~$0.10–0.40/day
-5. **executor/** — Order lifecycle state machine: submit → confirm fill → reconcile with exchange. Idempotent client order IDs. Crash-safe recovery: on restart, reconcile local state against open orders/balances before resuming.
-6. **storage/** — SQLite via `sqlx`. Tables: trades, positions, equity_curve, signals_log, ai_decisions, config_state.
-7. **dashboard/** — Axum on :8080 serving single-page UI: equity curve chart, open positions, trade history, P&L, AI decision feed, kill-switch button (flatten all + halt).
-8. **alerts/** — Telegram bot messages: every order/fill, daily summary, all risk events.
+1. **exchange/** — Signed REST (orders, balances, klines) + WebSocket kline and user-data streams. Rate-limit tracking, retry with exponential backoff. Read-only public endpoints usable before API keys exist.
+2. **strategy/** — Trait-based engine; concrete strategies declared in TOML files (indicator params, entry/exit rules from a small rule vocabulary). Launch hypothesis: EMA trend filter + RSI pullback entries, ATR stops. Explicitly treated as an unproven starting hypothesis — it is among the most-backtested retail templates and carries no assumed edge.
+3. **risk/** — Hard guardrails, non-overridable at runtime (§4).
+4. **executor/** — Order lifecycle state machine with idempotent client order IDs; correct OCO sequencing and flatten ordering (§6); restart reconciliation before any trading resumes.
+5. **storage/** — SQLite tables: trades, orders, positions, equity_curve, signals_log, config_state. Trade rows carry everything required for tax cost-basis export; `export csv` CLI subcommand produces per-fill records (time, pair, side, qty, price, fee) suitable for tax software/import.
+6. **alerts/** — Telegram: fills, rejections, risk events, daily summary, hourly heartbeat (alert if silent > 90 min).
+7. **backtester/** — First-class module, not an afterthought (§5).
+8. **dashboard/** — Axum, bound to 127.0.0.1, bearer-token auth: equity curve, positions, history, P&L, kill switch (cancel-all → flatten → halt).
 
-## 4. Decision Loop
+## 4. Risk Model (reconciled with capital)
 
-On each 1h candle close:
+Two modes, selected automatically by account equity:
+
+**Fixed-dollar mode (equity < $500) — launch mode**
+- Risk per trade: **$2 fixed** (config)
+- Max **1 open position**
+- Notional cap: computed position ≤ 50% of equity
+- Skip trade if computed notional < $15 (stays clear of Binance ~$5–10 min-notional with buffer)
+- Daily halt: **−2% day or 2 consecutive stop-outs, whichever first**
+
+**Percent-risk mode (equity ≥ $500) — unlocks later**
+- Risk per trade: 1% of equity
+- Max **2 concurrent positions**; total open risk ≤ 2% of equity
+- Combined open notional ≤ 80% of equity (sizer takes the binding constraint)
+
+Both modes:
+- Daily −3% equity loss → flatten all, halt until manual reset
+- Stale data (> 2 missed candles) → refuse to act
+- Lot-size / step-size / min-notional compliance enforced by executor pre-submit
+
+Arithmetic check (the rev-1 defect): $200 equity → $2 risk ÷ ~2% stop ≈ $100 notional = 50% of account, one position, placeable, survivable. $600 equity → $6 risk ≈ $300 notional × 2 = $600 > 80% cap → sizer shrinks to cap. Coherent at every level.
+
+## 5. Research Process & Pre-Registered Go/No-Go Gate
+
+Development order puts the backtester and strategy search **before** any execution or UI work.
+
+**Backtester requirements:**
+- Replays historical 1h klines through the identical strategy/risk/executor code paths used live
+- Cost model: taker fees 0.1% per side (0.2% round trip; 0.15% with BNB discount) + slippage 0.05% per side
+- Data: ≥ 18 months of 1h klines per pair, fetched fresh from Binance REST
+- Split: optimize on oldest 70%, validate out-of-sample on newest 30%; OOS window untouched until final scoring
+
+**Pre-registered gate — written before any backtest is run:**
+
+Go live only if ALL hold on out-of-sample data after full costs:
+1. Profit factor ≥ 1.30
+2. Profitable OOS on ≥ 3 of 5 tested pairs
+3. OOS max drawdown < 20%
+4. ≥ 20 OOS trades per pair (sample size floor)
+5. Total distinct configurations tested across the whole search ≤ 20 (multiple-comparison control)
+
+**Fail any → no live deployment.** Iterate with a new OOS window or abandon the variant. The gate exists because a 1h strategy backtested without realistic costs reliably looks profitable and isn't; risk rails bound loss rate but create no edge.
+
+## 6. Execution Mechanics
+
+Corrected from rev 1 (Binance spot OCO cannot contain an entry leg):
 
 ```
-WS kline closes ─▶ update indicators ─▶ strategy emits raw signals
-                                             │
-   ai_overlay bias scores ──────────────────▶ risk manager
-                                             │  ├─ size = equity × 1% ÷ ATR stop distance
-                                             │  ├─ veto if daily loss / max pos / stale data
-                                             │  ▼
-                                        executor places OCO
-                                     (entry + TP + SL on Binance)
-                                             │
-                                  SQLite log → Telegram → dashboard
+signal → risk pass → LIMIT entry (idempotent client ID)
+  → fill detected via user-data WS stream
+    → place OCO: take-profit limit + stop-loss leg
 ```
 
-## 5. Error Handling
+- Stop-loss legs prefer stop-market semantics where available; **explicit honesty note: exchange-side stops bound losses *usually* — gaps can slip through a stop-limit. Downside is bounded in expectation, not guaranteed tick-for-tick.**
+- Flatten-all ordering: cancel all open orders → confirm cancellations → market-reduce positions → verify balances against expected state. Never market-sell while an OCO can trigger mid-sequence.
+- Kill switch (dashboard + Telegram command) runs the flatten sequence then halts the engine.
 
-- WS disconnect → auto-reconnect, backfill missing candles from REST
-- Any restart → full reconciliation against Binance open orders + balances before trading resumes
-- Unrecoverable exchange errors → Telegram alert + safe halt (existing positions keep exchange-side SL/TP)
-- All secrets in `.env` (gitignored); no keys ever logged or stored in DB
+## 7. Security
 
-## 6. Testing & Rollout Plan
+- Binance API key: **spot trading enabled, withdrawals disabled, IP-whitelisted** — highest-value control, applied at key creation before first use
+- Secrets in `.env` (gitignored); keys never logged, never stored in DB
+- Dashboard: 127.0.0.1 bind + bearer token; never exposed to LAN/internet in v1
 
-1. **Unit tests** — indicators, position sizing math, state machine transitions
-2. **Backtester** — replays historical klines through the same strategy code; report win rate, profit factor, max drawdown per pair before go-live
-3. **Shadow mode** — bot fully connected, logs hypothetical fills instead of ordering; recommended first 3–7 days of operation; toggled by one config value
-4. **Live-small** — start with $100–300
+## 8. Reliability
 
-## 7. Explicit Non-Goals (v1)
+- Restart → full reconciliation against open orders + balances before resuming
+- WS disconnect → reconnect + REST backfill of missed candles
+- Unrecoverable errors → Telegram alert + safe halt (existing positions keep exchange-side TP/SL)
+- launchd job auto-restarts the binary; hourly Telegram heartbeat; silence > 90 min alerts the user
+- Stages: unit tests → **Binance spot testnet** (`testnet.binance.vision`) end-to-end suite → shadow mode → live
 
+## 9. Deferred to v2 (gated)
+
+- **AI news/sentiment overlay:** only when capital ≥ $3k AND built with counterfactual logging from day one (every cycle logs decision-with-veto and decision-without so its P&L impact is measurable). Rev-1 finding stands: a per-day-cost LLM loop on a $100–300 account is negative-EV regardless of signal quality.
+- Multi-position percent mode beyond 2 slots, additional strategies, futures/margin (still likely never).
+
+## 10. Rollout Plan
+
+| Phase | Content | Exit criteria |
+|---|---|---|
+| 1 (wks 1–2) | Exchange client (public endpoints), storage, backtester, strategy search | Gate in §5 passed or project paused honestly |
+| 2 | Executor, risk manager, testnet suite green | Testnet round-trips reliably for ≥ 3 days |
+| 3 | Shadow mode live-connected, Telegram-only monitoring | 3–7 days clean behavior, fills match expectations |
+| 4 | Live-small: $100–300 real money; dashboard completed | — |
+
+## 11. Explicit Non-Goals (v1)
+
+- No LLM in the trade path
 - No futures/margin/leverage — spot only
 - No HFT — candle-close cadence only
-- No guaranteed returns — bounded downside is the design goal
-- No multi-exchange support — Binance only
+- No guaranteed returns — bounded, survivable downside is the design goal
+- No multi-exchange support
