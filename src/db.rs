@@ -75,6 +75,19 @@ CREATE TABLE IF NOT EXISTS config_state(
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS backtest_runs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  config_hash TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  rsi_entry REAL NOT NULL,
+  atr_mult REAL NOT NULL,
+  rr REAL NOT NULL,
+  oos_trades INTEGER NOT NULL,
+  oos_pf REAL NOT NULL,
+  oos_pnl REAL NOT NULL,
+  oos_dd REAL NOT NULL,
+  ran_at INTEGER NOT NULL
+);
 "#;
 
 impl Db {
@@ -159,6 +172,39 @@ impl Db {
         )
         .bind(key)
         .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_backtest_run(
+        &self,
+        config_hash: &str,
+        symbol: &str,
+        rsi_entry: f64,
+        atr_mult: f64,
+        rr: f64,
+        oos_trades: i64,
+        oos_pf: f64,
+        oos_pnl: f64,
+        oos_dd: f64,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO backtest_runs(config_hash,symbol,rsi_entry,atr_mult,rr,
+             oos_trades,oos_pf,oos_pnl,oos_dd,ran_at)
+             VALUES(?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(config_hash)
+        .bind(symbol)
+        .bind(rsi_entry)
+        .bind(atr_mult)
+        .bind(rr)
+        .bind(oos_trades)
+        .bind(oos_pf)
+        .bind(oos_pnl)
+        .bind(oos_dd)
+        .bind(chrono::Utc::now().timestamp_millis())
         .execute(&self.pool)
         .await?;
         Ok(())

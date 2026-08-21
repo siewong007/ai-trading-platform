@@ -1,4 +1,4 @@
-use crate::strategy::{generate_signals, BacktestSection, StrategySection, TradePlan};
+use crate::strategy::{generate_signals, BacktestSection, StrategySection};
 use crate::types::Candle;
 
 /// Hard cost model from spec §5 — shared by every backtest, never relaxed.
