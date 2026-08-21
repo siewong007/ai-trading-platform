@@ -115,9 +115,9 @@ mod tests {
         assert!(r[3].is_some());
         assert!(approx(r[3].unwrap(), 100.0));
         // after one loss: avg_gain=(1*2+0)/3=2/3, avg_loss=(0*2+1)/3=1/3
-        let rs = (2.0 / 3.0) / (1.0 / 3.0);
-        let expect = 100.0 - 100.0 / (1.0 + rs);
-        assert!(approx(r[4].unwrap(), expect));
+        // RS = 2 => RSI = 100 - 100/3 = 66.6666... (hand-derived literal,
+        // deliberately NOT recomputed via the implementation's formula)
+        assert!(approx(r[4].unwrap(), 66.666_666_666));
     }
 
     #[test]
@@ -131,6 +131,27 @@ mod tests {
         assert_eq!(a[2], None); // needs period TRs => available from idx period(3)
         assert!(approx(a[3].unwrap(), 2.0));
         assert!(approx(a[4].unwrap(), 2.0));
+    }
+
+    #[test]
+    fn atr_wilder_smoothing_hand_computed_distinct_ranges() {
+        // TR = max(H-L, |H-prevC|, |L-prevC|), hand-computed per bar:
+        //   i=1: max(2, |11-10|=1,  |9-10|=1)      = 2
+        //   i=2: max(1, |10.5-10|=.5,|9.5-10|=.5)  = 1
+        //   i=3: max(2, |13-10|=3,  |11-10|=1)     = 3
+        //   i=4: max(2, |12-12|=0,  |10-12|=2)     = 2
+        //   i=5: max(2, |14-11|=3,  |12-11|=1)     = 3
+        // Wilder ATR(3): seed = mean(TR1..TR3) = (2+1+3)/3 = 2 at idx 3,
+        //   idx4: (2*2 + TR4=2)/3 = 2 ; idx5: (2*2 + TR5=3)/3 = 7/3 = 2.3333...
+        let h = [11.0, 11.0, 10.5, 13.0, 12.0, 14.0];
+        let l = [9.0, 9.0, 9.5, 11.0, 10.0, 12.0];
+        let c = [10.0, 10.0, 10.0, 12.0, 11.0, 13.0];
+        let a = atr(&h, &l, &c, 3);
+        assert_eq!(a[0], None);
+        assert_eq!(a[2], None);
+        assert!(approx(a[3].unwrap(), 2.0));
+        assert!(approx(a[4].unwrap(), 2.0));
+        assert!(approx(a[5].unwrap(), 2.333_333_333));
     }
 
     #[test]

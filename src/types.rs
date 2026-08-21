@@ -87,4 +87,15 @@ mod tests {
     fn rejects_garbage() {
         assert!(parse_klines("not json").is_err());
     }
+
+    #[test]
+    fn rejects_non_numeric_prices_in_valid_json_shape() {
+        // valid JSON array-of-arrays, but the OHLCV strings are not numbers
+        let bad = r#"[["1499040000000","zero","0.8","0.015","0.0157","100"]]"#;
+        assert!(parse_klines(bad).is_err());
+
+        // and a volume string that merely looks numeric-ish
+        let bad2 = r#"[["1499040000000","1","1","1","1","1,0"]]"#;
+        assert!(parse_klines(bad2).is_err());
+    }
 }
