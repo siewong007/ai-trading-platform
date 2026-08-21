@@ -8,7 +8,7 @@ mod types;
 
 use backtest::{run, BacktestOutput};
 use clap::{Parser, Subcommand};
-use db::Db;
+use db::{BacktestRunRow, Db};
 use exchange::Exchange;
 use metrics::{
     evaluate_gate, max_drawdown_pct, GateVerdict, Metrics, PairReport, GATE_MAX_VARIANTS,
@@ -114,6 +114,7 @@ async fn evaluate_config(
     record_hash: Option<&str>,
 ) -> anyhow::Result<Vec<PairResult>> {
     let mut results = Vec::new();
+    let mut rows: Vec<BacktestRunRow> = Vec::new();
     for pair in &strat.pairs {
         let candles = load_series(db, pair, &strat.timeframe).await?;
         let out: BacktestOutput = run(&candles, strat, bt);
@@ -137,19 +138,17 @@ async fn evaluate_config(
         // DD must be measured within the OOS window only
         oos_metrics.max_drawdown_pct = max_drawdown_pct(&oos_curve);
 
-        if let Some(hash) = record_hash {
-            db.record_backtest_run(
-                hash,
-                pair,
-                strat.rsi_entry_threshold,
-                strat.atr_multiplier,
-                strat.risk_reward_ratio,
-                oos_metrics.total_trades as i64,
-                oos_metrics.profit_factor,
-                oos_metrics.net_pnl,
-                oos_metrics.max_drawdown_pct,
-            )
-            .await?;
+        if record_hash.is_some() {
+            rows.push(BacktestRunRow {
+                symbol: pair.clone(),
+                rsi_entry: strat.rsi_entry_threshold,
+                atr_mult: strat.atr_multiplier,
+                rr: strat.risk_reward_ratio,
+                oos_trades: oos_metrics.total_trades as i64,
+                oos_pf: oos_metrics.profit_factor,
+                oos_pnl: oos_metrics.net_pnl,
+                oos_dd: oos_metrics.max_drawdown_pct,
+            });
         }
 
         results.push(PairResult {
@@ -157,6 +156,11 @@ async fn evaluate_config(
             is_metrics,
             oos_metrics,
         });
+    }
+    if let Some(hash) = record_hash {
+        // single transactional write: rows upserted + budget charged once per
+        // NEW distinct hash (re-runs are free)
+        db.record_backtest_results(hash, &rows).await?;
     }
     Ok(results)
 }
@@ -215,20 +219,27 @@ async fn run_backtest(config_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn config_hash(s: &StrategySection) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.rsi_entry_threshold.to_bits().hash(&mut h);
-    s.atr_multiplier.to_bits().hash(&mut h);
-    s.risk_reward_ratio.to_bits().hash(&mut h);
-    format!("{:016x}", h.finish())
+/// Pre-registered rule (spec §5): at most GATE_MAX_VARIANTS DISTINCT configs
+/// may EVER run. Re-running an already-known hash is free; a NEW hash that
+/// would push the distinct total past the cap is refused BEFORE any work.
+fn check_variant_budget(used_distinct: u32, is_new_hash: bool) -> anyhow::Result<()> {
+    if is_new_hash && used_distinct >= GATE_MAX_VARIANTS {
+        anyhow::bail!(
+            "refusing new config #{}: variant budget exhausted \
+             ({used_distinct}/{GATE_MAX_VARIANTS} distinct configs). Per spec §5 the \
+             budget never resets — new research requires a fresh out-of-sample \
+             window, documented before running.",
+            used_distinct + 1
+        );
+    }
+    Ok(())
 }
 
 async fn run_search(config_path: &str) -> anyhow::Result<()> {
     let base = StrategyConfig::load(config_path)?;
     let db = Db::open_default().await?;
 
-    // Pre-declared grid: 2 x 3 x 2 = 12 variants (spec: ≤ 20 total ever)
+    // Pre-declared grid: 2 x 3 x 2 = 12 variants (spec: ≤ 20 distinct ever)
     let mut variants: Vec<(f64, f64, f64)> = Vec::new(); // (rsi_entry, atr_mult, rr)
     for rsi_e in [30.0, 35.0] {
         for atr_m in [1.5, 2.0, 2.5] {
@@ -238,25 +249,16 @@ async fn run_search(config_path: &str) -> anyhow::Result<()> {
         }
     }
 
-    let used: u32 = db
+    // Budget counts DISTINCT config hashes ever run (never resets). The
+    // persisted counter is authoritative but never allowed to under-count vs
+    // the table.
+    let mut known = db.known_config_hashes().await?;
+    let counter: u32 = db
         .config_get("variant_budget_used")
         .await?
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let remaining = GATE_MAX_VARIANTS.saturating_sub(used);
-    if remaining == 0 {
-        anyhow::bail!(
-            "variant budget exhausted ({used}/{GATE_MAX_VARIANTS}). \
-             Per spec §5 the budget never resets — new research requires a \
-             fresh out-of-sample window, documented before running."
-        );
-    }
-    if variants.len() as u32 > remaining {
-        anyhow::bail!(
-            "grid has {} variants but only {remaining} of {GATE_MAX_VARIANTS} budget remain",
-            variants.len()
-        );
-    }
+    let mut used = counter.max(db.distinct_config_count().await?);
 
     #[allow(dead_code)] // reported fields kept for ranked output
     struct Row {
@@ -276,9 +278,19 @@ async fn run_search(config_path: &str) -> anyhow::Result<()> {
         strat.rsi_entry_threshold = rsi_e;
         strat.atr_multiplier = atr_m;
         strat.risk_reward_ratio = rr;
-        let hash = config_hash(&strat);
+        let hash = StrategyConfig {
+            strategy: strat.clone(),
+            backtest: base.backtest.clone(),
+        }
+        .config_hash();
+
+        // refuse NEW distinct hashes past the cap; re-running a known one is free
+        check_variant_budget(used, !known.contains(&hash))?;
 
         let results = evaluate_config(&db, &strat, &base.backtest, Some(&hash)).await?;
+        if known.insert(hash) {
+            used += 1; // charged atomically alongside that hash's inserted rows
+        }
         let reports: Vec<PairReport> = results
             .into_iter()
             .map(|r| PairReport {
@@ -298,7 +310,7 @@ async fn run_search(config_path: &str) -> anyhow::Result<()> {
             .fold(f64::INFINITY, f64::min);
 
         println!(
-            "rsi={rsi_e:>4} atr={atr_m:>3} rr={rr:>3} | floor:{} prof:{profitable} worstPF:{:.2} trades:{} | {}",
+            "rsi={rsi_e:>4} atr={atr_m:>3} rr={rr:>3} | floor:{} prof:{profitable} worstPF:{:.2} trades:{} budget:{used}/{GATE_MAX_VARIANTS} | {}",
             passing_floor,
             if worst_pf.is_infinite() { f64::NAN } else { worst_pf },
             reports.iter().map(|r| r.metrics.total_trades).sum::<usize>(),
@@ -317,12 +329,8 @@ async fn run_search(config_path: &str) -> anyhow::Result<()> {
         });
     }
 
-    let new_used = used + rows.len() as u32;
-    db.config_set("variant_budget_used", &new_used.to_string())
-        .await?;
-
     rows.sort_by(|a, b| b.worst_pf.partial_cmp(&a.worst_pf).unwrap());
-    println!("\n=== ranked by worst-pair OOS PF (budget now {new_used}/{GATE_MAX_VARIANTS}) ===");
+    println!("\n=== ranked by worst-pair OOS PF (budget now {used}/{GATE_MAX_VARIANTS}) ===");
     if let Some(best) = rows.first() {
         println!(
             "best: rsi={} atr={} rr={} (worstPF {:.2}, {} profitable pairs)",
@@ -351,4 +359,20 @@ async fn run_search(config_path: &str) -> anyhow::Result<()> {
 
 async fn run_export(_out: &str) -> anyhow::Result<()> {
     anyhow::bail!("export arrives with live trading (Phase 2): no fills exist yet")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn variant_budget_refuses_21st_distinct_hash_but_reruns_are_free() {
+        assert!(check_variant_budget(GATE_MAX_VARIANTS - 1, true).is_ok());
+        // re-running an already-known hash is free, even at the cap
+        assert!(check_variant_budget(GATE_MAX_VARIANTS, false).is_ok());
+        assert!(check_variant_budget(u32::MAX, false).is_ok());
+        // the 21st DISTINCT hash is refused before any work happens
+        let err = check_variant_budget(GATE_MAX_VARIANTS, true).unwrap_err();
+        assert!(err.to_string().contains("budget"), "{err}");
+    }
 }

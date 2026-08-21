@@ -158,55 +158,126 @@ impl Db {
     }
 
     pub async fn config_get(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let mut conn = self.pool.acquire().await?;
+        Self::config_get_in(&mut conn, key).await
+    }
+
+    pub async fn config_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        Self::config_set_in(&mut conn, key, value).await
+    }
+
+    async fn config_get_in(
+        conn: &mut sqlx::SqliteConnection,
+        key: &str,
+    ) -> anyhow::Result<Option<String>> {
         let row = sqlx::query("SELECT value FROM config_state WHERE key=?")
             .bind(key)
-            .fetch_optional(&self.pool)
+            .fetch_optional(conn)
             .await?;
         Ok(row.map(|r| r.get::<String, _>(0)))
     }
 
-    pub async fn config_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+    async fn config_set_in(
+        conn: &mut sqlx::SqliteConnection,
+        key: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT INTO config_state(key,value) VALUES(?,?)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         )
         .bind(key)
         .bind(value)
-        .execute(&self.pool)
+        .execute(conn)
         .await?;
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn record_backtest_run(
+    /// Config hashes already recorded in backtest_runs — re-running any of
+    /// these is free under the variant budget.
+    pub async fn known_config_hashes(
+        &self,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let rows = sqlx::query("SELECT DISTINCT config_hash FROM backtest_runs")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get::<String, _>(0)).collect())
+    }
+
+    /// Number of DISTINCT config hashes ever recorded.
+    pub async fn distinct_config_count(&self) -> anyhow::Result<u32> {
+        let row = sqlx::query("SELECT COUNT(DISTINCT config_hash) AS n FROM backtest_runs")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("n") as u32)
+    }
+}
+
+/// One OOS result row recorded for a backtested config on one symbol.
+#[derive(Debug)]
+pub struct BacktestRunRow {
+    pub symbol: String,
+    pub rsi_entry: f64,
+    pub atr_mult: f64,
+    pub rr: f64,
+    pub oos_trades: i64,
+    pub oos_pf: f64,
+    pub oos_pnl: f64,
+    pub oos_dd: f64,
+}
+
+impl Db {
+    /// Persist OOS results for one config hash with UPSERT semantics (stale
+    /// rows for the same hash+symbol are replaced, never duplicated), and
+    /// charge the variant-budget counter exactly ONCE per DISTINCT hash —
+    /// inside the SAME transaction as the inserts, so a mid-grid crash cannot
+    /// lose the charge.
+    pub async fn record_backtest_results(
         &self,
         config_hash: &str,
-        symbol: &str,
-        rsi_entry: f64,
-        atr_mult: f64,
-        rr: f64,
-        oos_trades: i64,
-        oos_pf: f64,
-        oos_pnl: f64,
-        oos_dd: f64,
+        rows: &[BacktestRunRow],
     ) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO backtest_runs(config_hash,symbol,rsi_entry,atr_mult,rr,
-             oos_trades,oos_pf,oos_pnl,oos_dd,ran_at)
-             VALUES(?,?,?,?,?,?,?,?,?,?)",
-        )
-        .bind(config_hash)
-        .bind(symbol)
-        .bind(rsi_entry)
-        .bind(atr_mult)
-        .bind(rr)
-        .bind(oos_trades)
-        .bind(oos_pf)
-        .bind(oos_pnl)
-        .bind(oos_dd)
-        .bind(chrono::Utc::now().timestamp_millis())
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        // existence check BEFORE deleting: decides whether this hash is new
+        let existed = sqlx::query("SELECT 1 FROM backtest_runs WHERE config_hash=? LIMIT 1")
+            .bind(config_hash)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if !existed {
+            let used: u32 = Self::config_get_in(&mut tx, "variant_budget_used")
+                .await?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            Self::config_set_in(&mut tx, "variant_budget_used", &(used + 1).to_string())
+                .await?;
+        }
+        for r in rows {
+            sqlx::query("DELETE FROM backtest_runs WHERE config_hash=? AND symbol=?")
+                .bind(config_hash)
+                .bind(&r.symbol)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO backtest_runs(config_hash,symbol,rsi_entry,atr_mult,rr,
+                 oos_trades,oos_pf,oos_pnl,oos_dd,ran_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?)",
+            )
+            .bind(config_hash)
+            .bind(&r.symbol)
+            .bind(r.rsi_entry)
+            .bind(r.atr_mult)
+            .bind(r.rr)
+            .bind(r.oos_trades)
+            .bind(r.oos_pf)
+            .bind(r.oos_pnl)
+            .bind(r.oos_dd)
+            .bind(chrono::Utc::now().timestamp_millis())
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -255,6 +326,73 @@ mod tests {
         assert_eq!(
             db.config_get("variants").await.unwrap(),
             Some("2".to_string())
+        );
+    }
+
+    fn br_row(symbol: &str, pnl: f64) -> BacktestRunRow {
+        BacktestRunRow {
+            symbol: symbol.into(),
+            rsi_entry: 35.0,
+            atr_mult: 2.0,
+            rr: 1.5,
+            oos_trades: 25,
+            oos_pf: 1.4,
+            oos_pnl: pnl,
+            oos_dd: 5.0,
+        }
+    }
+
+    async fn scalar(db: &Db, sql: &str) -> i64 {
+        sqlx::query(sql)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .get::<i64, _>(0)
+    }
+
+    #[tokio::test]
+    async fn rerunning_a_known_hash_is_free_and_upserts() {
+        let db = mem_db().await;
+        db.record_backtest_results("h1", &[br_row("BTCUSDT", 1.0)])
+            .await
+            .unwrap();
+        // duplicate invocation of the SAME hash: new numbers replace the row —
+        // no duplicate row, no extra budget charge
+        db.record_backtest_results("h1", &[br_row("BTCUSDT", 2.0)])
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar(&db, "SELECT COUNT(*) FROM backtest_runs WHERE config_hash='h1'").await,
+            1
+        );
+        let pnl = sqlx::query("SELECT oos_pnl FROM backtest_runs WHERE config_hash='h1'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .get::<f64, _>(0);
+        assert!((pnl - 2.0).abs() < 1e-9);
+        assert_eq!(
+            db.config_get("variant_budget_used").await.unwrap().as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_charged_once_per_distinct_hash() {
+        let db = mem_db().await;
+        db.record_backtest_results("h1", &[br_row("A", 1.0)]).await.unwrap();
+        db.record_backtest_results("h2", &[br_row("A", 2.0)]).await.unwrap();
+        db.record_backtest_results("h1", &[br_row("B", 3.0)]).await.unwrap(); // free rerun
+        assert_eq!(
+            db.config_get("variant_budget_used").await.unwrap().as_deref(),
+            Some("2")
+        );
+        assert_eq!(db.distinct_config_count().await.unwrap(), 2);
+        assert_eq!(db.known_config_hashes().await.unwrap().len(), 2);
+        // h1 now has rows for both symbols (A from first run, B from rerun)
+        assert_eq!(
+            scalar(&db, "SELECT COUNT(*) FROM backtest_runs WHERE config_hash='h1'").await,
+            2
         );
     }
 }

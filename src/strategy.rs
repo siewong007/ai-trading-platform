@@ -41,6 +41,39 @@ impl StrategyConfig {
     pub fn load_from_toml_str(raw: &str) -> anyhow::Result<Self> {
         Ok(toml::from_str(raw)?)
     }
+
+    /// Content hash over EVERY effective parameter (signals + sizing) in a
+    /// canonical sorted key=value form: identical configs always produce an
+    /// identical hash and changing ANY field changes it. This is the unit the
+    /// pre-registered variant budget charges against.
+    pub fn config_hash(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let s = &self.strategy;
+        let b = &self.backtest;
+        let fx = |v: f64| format!("{:016x}", v.to_bits()); // bit-exact, stable
+        let mut fields: Vec<(String, String)> = vec![
+            ("atr_multiplier".into(), fx(s.atr_multiplier)),
+            ("atr_period".into(), s.atr_period.to_string()),
+            ("ema_fast".into(), s.ema_fast.to_string()),
+            ("ema_slow".into(), s.ema_slow.to_string()),
+            ("max_notional_pct_equity".into(), fx(b.max_notional_pct_equity)),
+            ("min_notional_usd".into(), fx(b.min_notional_usd)),
+            ("pairs".into(), s.pairs.join(",")),
+            ("risk_per_trade_usd".into(), fx(b.risk_per_trade_usd)),
+            ("risk_reward_ratio".into(), fx(s.risk_reward_ratio)),
+            ("rsi_entry_threshold".into(), fx(s.rsi_entry_threshold)),
+            ("rsi_period".into(), s.rsi_period.to_string()),
+            ("start_equity_usd".into(), fx(b.start_equity_usd)),
+            ("strategy_name".into(), s.name.clone()),
+            ("timeframe".into(), s.timeframe.clone()),
+        ];
+        fields.sort(); // canonical ordering independent of TOML key order
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (k, v) in &fields {
+            format!("{k}={v};").hash(&mut h);
+        }
+        format!("{:016x}", h.finish())
+    }
 }
 
 /// A concrete trade plan produced on a candle close.
@@ -198,8 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn config_parses_from_toml() {
-        let raw = r#"
+    fn config_parses_from_toml() {        let raw = r#"
 [strategy]
 name = "ema_rsi_pullback"
 pairs = ["BTCUSDT", "ETHUSDT"]
@@ -221,5 +253,83 @@ min_notional_usd = 15.0
         let cfg: StrategyConfig = toml::from_str(raw).unwrap();
         assert_eq!(cfg.strategy.pairs.len(), 2);
         assert_eq!(cfg.backtest.risk_per_trade_usd, 2.0);
+    }
+
+    const HASH_TOML_A: &str = r#"
+[strategy]
+name = "h"
+pairs = ["BTCUSDT", "ETHUSDT"]
+timeframe = "1h"
+ema_fast = 50
+ema_slow = 200
+rsi_period = 14
+rsi_entry_threshold = 35.0
+atr_period = 14
+atr_multiplier = 2.0
+risk_reward_ratio = 1.5
+
+[backtest]
+start_equity_usd = 200.0
+risk_per_trade_usd = 2.0
+max_notional_pct_equity = 0.5
+min_notional_usd = 15.0
+"#;
+
+    // identical VALUES, keys/sections in different order -> must hash equal
+    const HASH_TOML_B: &str = r#"
+[backtest]
+min_notional_usd = 15.0
+max_notional_pct_equity = 0.5
+risk_per_trade_usd = 2.0
+start_equity_usd = 200.0
+
+[strategy]
+risk_reward_ratio = 1.5
+atr_multiplier = 2.0
+atr_period = 14
+rsi_entry_threshold = 35.0
+rsi_period = 14
+ema_slow = 200
+ema_fast = 50
+timeframe = "1h"
+pairs = ["BTCUSDT", "ETHUSDT"]
+name = "h"
+"#;
+
+    #[test]
+    fn config_hash_stable_across_identical_configs() {
+        let a: StrategyConfig = toml::from_str(HASH_TOML_A).unwrap();
+        let b: StrategyConfig = toml::from_str(HASH_TOML_B).unwrap();
+        assert_eq!(a.config_hash(), b.config_hash());
+        let again: StrategyConfig = toml::from_str(HASH_TOML_A).unwrap();
+        assert_eq!(a.config_hash(), again.config_hash());
+    }
+
+    #[test]
+    fn config_hash_changes_when_signal_or_sizing_param_changes() {
+        let a: StrategyConfig = toml::from_str(HASH_TOML_A).unwrap();
+        let mut variants: Vec<(&str, StrategyConfig)> = Vec::new();
+        let mut m = a.clone();
+        m.strategy.rsi_entry_threshold = 36.0;
+        variants.push(("rsi_entry_threshold", m));
+        let mut m = a.clone();
+        m.strategy.ema_fast = 49;
+        variants.push(("ema_fast", m));
+        let mut m = a.clone();
+        m.strategy.atr_multiplier = 2.5;
+        variants.push(("atr_multiplier", m));
+        let mut m = a.clone();
+        m.backtest.risk_per_trade_usd = 3.0;
+        variants.push(("risk_per_trade_usd", m));
+        let mut m = a.clone();
+        m.backtest.min_notional_usd = 20.0;
+        variants.push(("min_notional_usd", m));
+        for (name, cfg) in variants {
+            assert_ne!(
+                a.config_hash(),
+                cfg.config_hash(),
+                "{name} must change the hash"
+            );
+        }
     }
 }
