@@ -162,11 +162,6 @@ impl Db {
         Self::config_get_in(&mut conn, key).await
     }
 
-    pub async fn config_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        Self::config_set_in(&mut conn, key, value).await
-    }
-
     async fn config_get_in(
         conn: &mut sqlx::SqliteConnection,
         key: &str,
@@ -321,8 +316,13 @@ mod tests {
     async fn config_state_roundtrip() {
         let db = mem_db().await;
         assert_eq!(db.config_get("variants").await.unwrap(), None);
-        db.config_set("variants", "1").await.unwrap();
-        db.config_set("variants", "2").await.unwrap();
+        {
+            // scoped: :memory: pool has ONE connection — release it before
+            // config_get acquires again
+            let mut conn = db.pool.acquire().await.unwrap();
+            Db::config_set_in(&mut conn, "variants", "1").await.unwrap();
+            Db::config_set_in(&mut conn, "variants", "2").await.unwrap();
+        }
         assert_eq!(
             db.config_get("variants").await.unwrap(),
             Some("2".to_string())
