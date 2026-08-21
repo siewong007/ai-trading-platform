@@ -163,6 +163,12 @@ impl Db {
         Self::config_get_in(&mut conn, key).await
     }
 
+    #[allow(dead_code)] // Phase 2 (risk day-state persistence) consumes this
+    pub async fn config_set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        Self::config_set_in(&mut conn, key, value).await
+    }
+
     async fn config_get_in(
         conn: &mut sqlx::SqliteConnection,
         key: &str,
