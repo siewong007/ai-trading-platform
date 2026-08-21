@@ -11,8 +11,7 @@ use clap::{Parser, Subcommand};
 use db::Db;
 use exchange::Exchange;
 use metrics::{
-    evaluate_gate, max_drawdown_pct, GateVerdict, Metrics, GATE_MAX_VARIANTS,
-    PairReport,
+    evaluate_gate, max_drawdown_pct, GateVerdict, Metrics, PairReport, GATE_MAX_VARIANTS,
 };
 use strategy::{BacktestSection, StrategyConfig, StrategySection};
 use types::Candle;
@@ -57,8 +56,7 @@ fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
     let cli = Cli::parse();
@@ -78,7 +76,9 @@ async fn run_fetch(config_path: &str) -> anyhow::Result<()> {
     let ex = Exchange::new(BINANCE_BASE)?;
     let start = chrono::Utc::now().timestamp_millis() - LOOKBACK_DAYS * 86_400_000;
     for pair in &cfg.strategy.pairs {
-        let ks = ex.fetch_klines(pair, &cfg.strategy.timeframe, start).await?;
+        let ks = ex
+            .fetch_klines(pair, &cfg.strategy.timeframe, start)
+            .await?;
         let span_days = if ks.len() > 1 {
             (ks.last().unwrap().open_time - ks.first().unwrap().open_time) / 86_400_000
         } else {
@@ -90,11 +90,7 @@ async fn run_fetch(config_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn load_series(
-    db: &Db,
-    pair: &str,
-    timeframe: &str,
-) -> anyhow::Result<Vec<Candle>> {
+async fn load_series(db: &Db, pair: &str, timeframe: &str) -> anyhow::Result<Vec<Candle>> {
     let candles = db.load_klines(pair, timeframe).await?;
     if candles.len() < 500 {
         anyhow::bail!(
@@ -122,8 +118,7 @@ async fn evaluate_config(
         let candles = load_series(db, pair, &strat.timeframe).await?;
         let out: BacktestOutput = run(&candles, strat, bt);
 
-        let split_idx =
-            ((candles.len() as f64 * IS_FRACTION) as usize).min(candles.len() - 1);
+        let split_idx = ((candles.len() as f64 * IS_FRACTION) as usize).min(candles.len() - 1);
         let oos_start_ts = candles[split_idx].open_time;
 
         let (is_trades, oos_trades): (Vec<_>, Vec<_>) = out
@@ -199,7 +194,10 @@ fn print_report(results: &[PairResult]) -> GateVerdict {
         );
     }
     let verdict = evaluate_gate(&reports);
-    println!("\nGATE VERDICT: {}", if verdict.pass { "PASS ✅" } else { "FAIL ❌" });
+    println!(
+        "\nGATE VERDICT: {}",
+        if verdict.pass { "PASS ✅" } else { "FAIL ❌" }
+    );
     for reason in &verdict.reasons {
         println!("  - {reason}");
     }
@@ -257,6 +255,7 @@ async fn run_search(config_path: &str) -> anyhow::Result<()> {
         );
     }
 
+    #[allow(dead_code)] // reported fields kept for ranked output
     struct Row {
         rsi: f64,
         atr: f64,
@@ -310,10 +309,7 @@ async fn run_search(config_path: &str) -> anyhow::Result<()> {
             pairs_passing_floor: passing_floor,
             profitable_pairs: profitable,
             worst_pf,
-            total_oos_trades: reports
-                .iter()
-                .map(|r| r.metrics.total_trades)
-                .sum(),
+            total_oos_trades: reports.iter().map(|r| r.metrics.total_trades).sum(),
             pass: verdict.pass,
         });
     }
@@ -330,7 +326,11 @@ async fn run_search(config_path: &str) -> anyhow::Result<()> {
             best.rsi,
             best.atr,
             best.rr,
-            if best.worst_pf.is_infinite() { f64::NAN } else { best.worst_pf },
+            if best.worst_pf.is_infinite() {
+                f64::NAN
+            } else {
+                best.worst_pf
+            },
             best.profitable_pairs
         );
     }

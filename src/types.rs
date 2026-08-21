@@ -13,15 +13,15 @@ pub struct Candle {
 /// Raw Binance kline row: array of mixed strings/ints.
 #[derive(Deserialize)]
 struct RawKline(
-    i64,       // open time
-    String,    // open
-    String,    // high
-    String,    // low
-    String,    // close
-    String,    // volume
-    #[allow(dead_code)] i64, // close time
+    i64,                        // open time
+    String,                     // open
+    String,                     // high
+    String,                     // low
+    String,                     // close
+    String,                     // volume
+    #[allow(dead_code)] i64,    // close time
     #[allow(dead_code)] String, // quote volume
-    #[allow(dead_code)] i64, // trades
+    #[allow(dead_code)] i64,    // trades
     #[allow(dead_code)] String, // taker base vol
     #[allow(dead_code)] String, // taker quote vol
     #[allow(dead_code)] String, // ignore
@@ -44,17 +44,17 @@ impl TryFrom<RawKline> for Candle {
 
 pub fn parse_klines(json: &str) -> anyhow::Result<Vec<Candle>> {
     let raw: Vec<RawKline> = serde_json::from_str(json)?;
-    raw.into_iter()
-        .map(|r| Candle::try_from(r))
-        .collect()
+    raw.into_iter().map(Candle::try_from).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)] // Phase 2 (executor) consumes these
 pub enum Side {
     Long,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)] // Phase 2 (shadow/live modes) consumes this
 pub enum FillMode {
     Backtest,
     Shadow,

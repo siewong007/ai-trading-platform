@@ -77,8 +77,7 @@ pub fn generate_signals(candles: &[Candle], cfg: &StrategySection) -> Vec<Option
         // trend filter: price above slow EMA and fast EMA above slow EMA
         let trending_up = closes[i] > es && ef > es;
         // RSI crosses UP through the entry threshold (pullback ending)
-        let rsi_cross_up =
-            r_prev < cfg.rsi_entry_threshold && r_now >= cfg.rsi_entry_threshold;
+        let rsi_cross_up = r_prev < cfg.rsi_entry_threshold && r_now >= cfg.rsi_entry_threshold;
 
         if trending_up && rsi_cross_up {
             let entry = closes[i];

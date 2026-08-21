@@ -5,6 +5,7 @@ pub struct Metrics {
     pub total_trades: usize,
     /// gross profit / gross loss; INF when no losses and >0 profit
     pub profit_factor: f64,
+    #[allow(dead_code)] // surfaced in Phase 2 dashboard
     pub win_rate: f64,
     pub net_pnl: f64,
     pub max_drawdown_pct: f64,
@@ -104,10 +105,7 @@ pub fn evaluate_gate(reports: &[PairReport]) -> GateVerdict {
         ));
     }
 
-    let profitable_pairs = reports
-        .iter()
-        .filter(|r| r.metrics.net_pnl > 0.0)
-        .count();
+    let profitable_pairs = reports.iter().filter(|r| r.metrics.net_pnl > 0.0).count();
     if profitable_pairs < GATE_MIN_PROFITABLE_PAIRS {
         reasons.push(format!(
             "{} profitable pairs < {} required",
@@ -120,10 +118,16 @@ pub fn evaluate_gate(reports: &[PairReport]) -> GateVerdict {
         .map(|r| r.metrics.max_drawdown_pct)
         .fold(0.0f64, f64::max);
     if worst_dd >= GATE_MAX_DD_PCT {
-        reasons.push(format!("max drawdown {:.1}% >= {:.1}%", worst_dd, GATE_MAX_DD_PCT));
+        reasons.push(format!(
+            "max drawdown {:.1}% >= {:.1}%",
+            worst_dd, GATE_MAX_DD_PCT
+        ));
     }
 
-    GateVerdict { pass: reasons.is_empty(), reasons }
+    GateVerdict {
+        pass: reasons.is_empty(),
+        reasons,
+    }
 }
 
 #[cfg(test)]
@@ -140,7 +144,11 @@ mod tests {
             exit_price: 100.0 + pnl * 100.0,
             pnl,
             pnl_pct: pnl / 10.0,
-            exit_reason: if pnl > 0.0 { ExitReason::Target } else { ExitReason::Stop },
+            exit_reason: if pnl > 0.0 {
+                ExitReason::Target
+            } else {
+                ExitReason::Stop
+            },
         }
     }
 
@@ -165,7 +173,10 @@ mod tests {
         let curve: Vec<EquityPoint> = [200.0, 210.0, 189.0, 205.0]
             .iter()
             .enumerate()
-            .map(|(i, &e)| EquityPoint { ts: i as i64, equity: e })
+            .map(|(i, &e)| EquityPoint {
+                ts: i as i64,
+                equity: e,
+            })
             .collect();
         // peak 210 trough 189 => dd = 21/210 = 10%
         assert!((max_drawdown_pct(&curve) - 10.0).abs() < 1e-9);
@@ -175,16 +186,10 @@ mod tests {
     fn gate_fails_without_enough_trades_or_pairs() {
         let good_pair = |sym: &str, n: usize, pnl_per: f64| PairReport {
             symbol: sym.into(),
-            metrics: compute(
-                &(0..n).map(|_| tr(pnl_per)).collect::<Vec<_>>(),
-                &[],
-            ),
+            metrics: compute(&(0..n).map(|_| tr(pnl_per)).collect::<Vec<_>>(), &[]),
         };
         // all winning but only 5 trades/pair on 2 pairs
-        let v = evaluate_gate(&[
-            good_pair("A", 5, 1.0),
-            good_pair("B", 5, 1.0),
-        ]);
+        let v = evaluate_gate(&[good_pair("A", 5, 1.0), good_pair("B", 5, 1.0)]);
         assert!(!v.pass);
 
         // 4/4 pairs, 30 trades each, PF inf, dd small -> pass
@@ -219,13 +224,26 @@ mod tests {
         };
         assert!((low_pf.metrics.profit_factor - 1.2).abs() < 1e-9);
         let v = evaluate_gate(&[low_pf]);
-        assert!(v.reasons.iter().any(|r| r.contains("PF")), "{:?}", v.reasons);
+        assert!(
+            v.reasons.iter().any(|r| r.contains("PF")),
+            "{:?}",
+            v.reasons
+        );
 
         // deep drawdown fails even with great PF
         let curve = vec![
-            EquityPoint { ts: 0, equity: 100.0 },
-            EquityPoint { ts: 1, equity: 70.0 },
-            EquityPoint { ts: 2, equity: 99.0 },
+            EquityPoint {
+                ts: 0,
+                equity: 100.0,
+            },
+            EquityPoint {
+                ts: 1,
+                equity: 70.0,
+            },
+            EquityPoint {
+                ts: 2,
+                equity: 99.0,
+            },
         ];
         let deep_dd = PairReport {
             symbol: "W".into(),

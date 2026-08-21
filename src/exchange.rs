@@ -23,8 +23,13 @@ impl Exchange {
         })
     }
 
+    #[allow(dead_code)] // health checks use this in Phase 2
     pub async fn ping(&self) -> anyhow::Result<()> {
-        self.http.get(format!("{}/api/v3/ping", self.base)).send().await?.error_for_status()?;
+        self.http
+            .get(format!("{}/api/v3/ping", self.base))
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 

@@ -55,12 +55,7 @@ fn rsi_from(avg_gain: f64, avg_loss: f64) -> f64 {
 }
 
 /// Wilder's ATR over OHLC candles.
-pub fn atr(
-    highs: &[f64],
-    lows: &[f64],
-    closes: &[f64],
-    period: usize,
-) -> Vec<Option<f64>> {
+pub fn atr(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) -> Vec<Option<f64>> {
     let n = closes.len();
     let mut out: Vec<Option<f64>> = vec![None; n];
     if n < period + 1 || period == 0 {
