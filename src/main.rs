@@ -201,6 +201,9 @@ fn print_report(results: &[PairResult]) -> GateVerdict {
     for reason in &verdict.reasons {
         println!("  - {reason}");
     }
+    for note in &verdict.notes {
+        println!("  note: {note}");
+    }
     verdict
 }
 

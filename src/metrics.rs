@@ -72,11 +72,16 @@ pub struct PairReport {
 #[derive(Debug)]
 pub struct GateVerdict {
     pub pass: bool,
+    /// fatal problems — any entry means FAIL
     pub reasons: Vec<String>,
+    /// non-fatal observations (e.g. some pairs below the trade floor); they
+    /// matter only via qualification, never as an independent veto
+    pub notes: Vec<String>,
 }
 
 pub fn evaluate_gate(reports: &[PairReport]) -> GateVerdict {
     let mut reasons = Vec::new();
+    let mut notes = Vec::new();
 
     // pooled PF across all pairs that meet the sample-size floor
     let qualifying: Vec<&PairReport> = reports
@@ -84,9 +89,18 @@ pub fn evaluate_gate(reports: &[PairReport]) -> GateVerdict {
         .filter(|r| r.metrics.total_trades >= GATE_MIN_TRADES_PER_PAIR)
         .collect();
     if qualifying.len() < reports.len() {
-        reasons.push(format!(
+        notes.push(format!(
             "{}/{} pairs below trade-count floor ({} needed)",
             reports.len() - qualifying.len(),
+            reports.len(),
+            GATE_MIN_TRADES_PER_PAIR
+        ));
+    }
+    // zero pairs qualify -> the PF check is impossible: the gate must FAIL,
+    // never silently pass
+    if qualifying.is_empty() {
+        reasons.push(format!(
+            "0/{} pairs meet the trade-count floor ({} needed) — profit-factor check impossible",
             reports.len(),
             GATE_MIN_TRADES_PER_PAIR
         ));
@@ -105,11 +119,15 @@ pub fn evaluate_gate(reports: &[PairReport]) -> GateVerdict {
         ));
     }
 
-    let profitable_pairs = reports.iter().filter(|r| r.metrics.net_pnl > 0.0).count();
+    // "profitable OOS on >= 3 of N pairs", literally: thin pairs (< trade
+    // floor) count as NOT profitable, so >=3 must hold among ALL evaluated
+    let profitable_pairs = qualifying.iter().filter(|r| r.metrics.net_pnl > 0.0).count();
     if profitable_pairs < GATE_MIN_PROFITABLE_PAIRS {
         reasons.push(format!(
-            "{} profitable pairs < {} required",
-            profitable_pairs, GATE_MIN_PROFITABLE_PAIRS
+            "{} profitable pairs (of {} evaluated) < {} required",
+            profitable_pairs,
+            reports.len(),
+            GATE_MIN_PROFITABLE_PAIRS
         ));
     }
 
@@ -127,6 +145,7 @@ pub fn evaluate_gate(reports: &[PairReport]) -> GateVerdict {
     GateVerdict {
         pass: reasons.is_empty(),
         reasons,
+        notes,
     }
 }
 
@@ -201,7 +220,7 @@ mod tests {
         ]);
         assert!(v.pass, "expected pass, got {:?}", v.reasons);
 
-        // one losing pair drops profitable count to 2 (<3)
+        // one losing pair drags the worst qualifying-pair PF below the floor
         let v = evaluate_gate(&[
             good_pair("A", 30, 1.0),
             good_pair("B", 30, 1.0),
@@ -209,6 +228,62 @@ mod tests {
             good_pair("D", 30, -1.0),
         ]);
         assert!(!v.pass);
+    }
+
+    #[test]
+    fn gate_counts_only_thick_pairs_as_profitable() {
+        let pair = |sym: &str, n: usize, pnl_per: f64| PairReport {
+            symbol: sym.into(),
+            metrics: compute(&(0..n).map(|_| tr(pnl_per)).collect::<Vec<_>>(), &[]),
+        };
+
+        // 2 profitable of 5 evaluated -> FAIL: needs >= 3 among ALL pairs,
+        // and thin pairs can never count as profitable
+        let v = evaluate_gate(&[
+            pair("A", 30, 1.0),
+            pair("B", 30, 1.0),
+            pair("C", 5, 1.0), // profitable-looking but below trade floor
+            pair("D", 5, 1.0),
+            pair("E", 5, 1.0),
+        ]);
+        assert!(!v.pass);
+        assert!(
+            v.reasons.iter().any(|r| r.contains("profitable pairs")),
+            "{:?}",
+            v.reasons
+        );
+
+        // 3 of 5 -> PASS: A/B/C qualify and are profitable; thin D/E only add
+        // a below-floor note
+        let v = evaluate_gate(&[
+            pair("A", 30, 1.0),
+            pair("B", 30, 1.0),
+            pair("C", 30, 1.0),
+            pair("D", 5, 1.0),
+            pair("E", 5, -1.0),
+        ]);
+        assert!(v.pass, "expected 3-of-5 pass, got {:?}", v.reasons);
+    }
+
+    #[test]
+    fn gate_fails_when_zero_pairs_qualify() {
+        // all five pairs below the trade-count floor -> zero qualifying pairs:
+        // gate must fail explicitly instead of silently skipping the PF check
+        let thin: Vec<PairReport> = (0..5)
+            .map(|i| {
+                PairReport {
+                    symbol: format!("P{i}"),
+                    metrics: compute(&(0..5).map(|_| tr(1.0)).collect::<Vec<_>>(), &[]),
+                }
+            })
+            .collect();
+        let v = evaluate_gate(&thin);
+        assert!(!v.pass);
+        assert!(
+            v.reasons.iter().any(|r| r.contains("0/5")),
+            "{:?}",
+            v.reasons
+        );
     }
 
     #[test]
