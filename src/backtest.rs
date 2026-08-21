@@ -14,7 +14,7 @@ pub struct TradeRecord {
     pub entry_price: f64,
     pub exit_price: f64,
     pub pnl: f64,
-    /// (exit-entry)/entry net of costs
+    /// net PnL as a fraction of entry notional (fees + slippage included)
     pub pnl_pct: f64,
     pub exit_reason: ExitReason,
 }
@@ -103,7 +103,9 @@ pub fn run(candles: &[Candle], strat: &StrategySection, bt: &BacktestSection) ->
                     entry_price: p.entry_price,
                     exit_price,
                     pnl,
-                    pnl_pct: (exit_price - p.entry_price) / p.entry_price,
+                    // net of both sides' fees AND slippage: pnl already is,
+                    // and the denominator is the gross entry notional
+                    pnl_pct: pnl / (p.entry_price * p.qty),
                     exit_reason: reason,
                 });
             } else {
@@ -180,11 +182,14 @@ mod tests {
     }
 
     fn bt_cfg(equity: f64, risk: f64) -> BacktestSection {
+        // single source of truth: floors/caps come from the shipped config,
+        // never re-hardcoded here
+        let cfg = StrategyConfig::load_from_toml_str(CFG_TOML).unwrap();
         BacktestSection {
             start_equity_usd: equity,
             risk_per_trade_usd: risk,
-            max_notional_pct_equity: 0.5,
-            min_notional_usd: 15.0,
+            max_notional_pct_equity: cfg.backtest.max_notional_pct_equity,
+            min_notional_usd: cfg.backtest.min_notional_usd,
         }
     }
 

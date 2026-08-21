@@ -331,6 +331,8 @@ async fn run_search(config_path: &str) -> anyhow::Result<()> {
 
     rows.sort_by(|a, b| b.worst_pf.partial_cmp(&a.worst_pf).unwrap());
     println!("\n=== ranked by worst-pair OOS PF (budget now {used}/{GATE_MAX_VARIANTS}) ===");
+    println!("RANKING IS ANALYSIS ONLY — NOT A GO SIGNAL.");
+    println!("The pre-registered gate verdict is the sole go/no-go authority.");
     if let Some(best) = rows.first() {
         println!(
             "best: rsi={} atr={} rr={} (worstPF {:.2}, {} profitable pairs)",
