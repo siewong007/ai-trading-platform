@@ -22,4 +22,6 @@ dotenvy = "0.15"
 wiremock = "0.6"
 
 [profile.release]
-lto = "thin"
+# NOTE: no LTO — thin-LTO breaks dlopen of proc-macro dylibs built on this
+# exFAT external volume ("mis-aligned LINKEDIT string pool").
+opt-level = 3

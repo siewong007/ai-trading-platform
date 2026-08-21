@@ -1,0 +1,6 @@
+# Build artifacts live on the internal APFS disk: this project sits on an
+# exFAT external SSD, where release-profile proc-macro dylibs come out
+# mis-aligned and dyld refuses to load them. Internal target dir also
+# massively speeds up linking.
+[build]
+target-dir = "/Users/goaltosuceed/.cargo-target/trading_platform"
