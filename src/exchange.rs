@@ -78,10 +78,16 @@ impl Exchange {
                 }
                 429 | 418 if attempts < 5 => {
                     tracing::warn!(%symbol, status = %resp.status(), "rate limited, backing off");
-                    tokio::time::sleep(std::time::Duration::from_secs(
-                        self.backoff_base_secs * attempts as u64,
-                    ))
-                    .await;
+                    // honor the server's Retry-After (seconds) when present;
+                    // otherwise fall back to the fixed escalating backoff
+                    let retry_after = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<u64>().ok());
+                    let secs =
+                        retry_after.unwrap_or_else(|| self.backoff_base_secs * attempts as u64);
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                 }
                 s => anyhow::bail!("binance klines {symbol} HTTP {s} after {attempts} attempts"),
             }
@@ -138,6 +144,37 @@ mod tests {
         let ex = Exchange::with_backoff(&server.uri(), 0).unwrap();
         let ks = ex.fetch_klines("X", "1h", 5000).await.unwrap();
         assert_eq!(ks[0].close, 1.0);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_backoff_honors_retry_after_header() {
+        let server = MockServer::start().await;
+        // Fallback backoff would sleep 120s; Retry-After: 0 must retry at once.
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .set_body_string("")
+                    .insert_header("Retry-After", "0"),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"[[5000,"1","1","1","7","1",5999,"q",1,"t","tq","0"]]"#),
+            )
+            .mount(&server)
+            .await;
+        let ex = Exchange::with_backoff(&server.uri(), 120).unwrap();
+        let started = std::time::Instant::now();
+        let ks = ex.fetch_klines("X", "1h", 5000).await.unwrap();
+        assert_eq!(ks[0].close, 7.0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "Retry-After: 0 was not honored (took {:?})",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
