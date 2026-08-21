@@ -199,6 +199,61 @@ mod tests {
         }
     }
 
+    /// Deterministic scenario producing EXACTLY ONE signal, hand-engineered:
+    /// bars 0-14 flat @100 with wide bodies (h=102,l=98) pin TR=4, so
+    /// ATR(3)=4.0 exactly. Bar 15 dips to 99.5 -> RSI(5) drops to 0; bar 16
+    /// recovers to 100.5 -> RSI crosses up through 40 while close > slow EMA
+    /// and fast EMA > slow EMA => plan on bar 16, fill on bar 17 (the last
+    /// bar, which rallies through the target without nearing the stop).
+    fn one_signal_series() -> Vec<Candle> {
+        let ts = |i: usize| i as i64 * 3_600_000;
+        let mut cs: Vec<Candle> = (0..15)
+            .map(|i| Candle {
+                open_time: ts(i),
+                open: 100.0,
+                high: 102.0,
+                low: 98.0,
+                close: 100.0,
+                volume: 100.0,
+            })
+            .collect();
+        cs.push(Candle {
+            open_time: ts(15),
+            open: 100.0,
+            high: 101.5,
+            low: 97.5,
+            close: 99.5,
+            volume: 100.0,
+        });
+        cs.push(Candle {
+            open_time: ts(16),
+            open: 99.5,
+            high: 102.5,
+            low: 98.5,
+            close: 100.5,
+            volume: 100.0,
+        });
+        cs.push(Candle {
+            open_time: ts(17),
+            open: 100.0,
+            high: 115.0,
+            low: 99.5,
+            close: 114.0,
+            volume: 100.0,
+        });
+        cs
+    }
+
+    /// small_cfg with the ATR multiplier engineered to 2.1125 so the stop
+    /// distance from the actual fill is exactly $8.00 and $2 risk buys
+    /// exactly 0.25 units — every downstream number is a finite decimal.
+    fn exact_strat() -> StrategySection {
+        StrategySection {
+            atr_multiplier: 2.1125,
+            ..small_cfg()
+        }
+    }
+
     #[test]
     fn config_file_loads_and_matches_spec_constants() {
         let cfg = StrategyConfig::load_from_toml_str(CFG_TOML).unwrap();
@@ -219,50 +274,44 @@ mod tests {
     }
 
     #[test]
-    fn full_run_profits_on_rally_and_books_exact_costs() {
-        let strat = small_cfg();
-        let mut cs: Vec<Candle> = Vec::new();
-        let mut i = 0usize;
-        for _ in 0..20 {
-            cs.push(candle(i, 100.0, 100.0));
-            i += 1;
-        }
-        let mut price = 100.0;
-        for _ in 0..60 {
-            cs.push(candle(i, price, price + 0.1));
-            price += 0.1;
-            i += 1;
-        }
-        for _ in 0..2 {
-            cs.push(candle(i, price, price - 0.5));
-            price -= 0.5;
-            i += 1;
-        }
-        cs.push(candle(i, price, price + 1.0)); // recovery -> signal
-        i += 1;
-        // escalating rally bars that will cross the take-profit target
-        let mut o = price + 1.0;
-        let mut c = o + 1.5;
-        for _ in 0..6 {
-            cs.push(candle(i, o, c));
-            i += 1;
-            o = c;
-            c += 1.5;
-        }
-
-        let out = run(&cs, &strat, &bt_cfg(200.0, 2.0));
-        assert!(!out.trades.is_empty(), "expected at least one trade");
-        let t = out.trades.first().unwrap();
-        // bookkeeping identity: pnl == gross - fees, fees charged both sides
-        let gross = (t.exit_price - t.entry_price) * t.qty;
-        let expected_fees = TAKER_FEE_RATE * t.qty * (t.entry_price + t.exit_price);
-        assert!((t.pnl - (gross - expected_fees)).abs() < 1e-9);
+    fn full_run_books_hand_computed_exact_literals() {
+        // ALL numbers below derived by hand BEFORE running the engine:
+        //
+        //   plan on bar 16: entry = close = 100.5, ATR(3) = 4.0 (all TRs are 4)
+        //     stop   = 100.5 - 2.1125 * 4          = 92.05
+        //     target = 100.5 + 1.5 * (100.5-92.05) = 113.175
+        //   fill on bar 17: 100 * (1 + 0.0005)     = 100.05      (slippage)
+        //   sizing: $2 risk / (100.05 - 92.05 = 8.00) = 0.25 units
+        //           cap = 0.5*200/100.05 = 0.99950... (not binding)
+        //           notional = 25.0125 >= $15 floor -> trade allowed
+        //   entry fee = 100.05    * 0.25 * 0.001 = 0.0250125
+        //   exit fill  = 113.175  * (1 - 0.0005) = 113.1184125 (slippage)
+        //   exit fee   = 113.1184125 * 0.25 * 0.001 = 0.028279603125
+        //   gross      = (113.1184125 - 100.05) * 0.25 = 3.267103125
+        //   net PnL    = 3.267103125 - 0.0250125 - 0.028279603125
+        //              = 3.213811021875
+        //   final eq   = 200 + 3.213811021875 = 203.213811021875
+        let out = run(&one_signal_series(), &exact_strat(), &bt_cfg(200.0, 2.0));
+        assert_eq!(out.trades.len(), 1);
+        let t = &out.trades[0];
         assert_eq!(t.exit_reason, ExitReason::Target);
-        // equity reflects the booked pnl exactly
+        assert!((t.qty - 0.25).abs() < 1e-9);
+        assert!((t.entry_price - 100.05).abs() < 1e-9, "entry fill incl. slippage");
         assert!(
-            (out.final_equity - (200.0 + out.trades.iter().map(|x| x.pnl).sum::<f64>())).abs()
-                < 1e-9
+            (t.exit_price - 113.1184125).abs() < 1e-9,
+            "target exit fill incl. slippage"
         );
+        // per-side fee literals booked inside the net figure:
+        let entry_fee: f64 = 0.0250125;
+        let exit_fee: f64 = 0.028279603125;
+        assert!((entry_fee - 100.05 * 0.25 * TAKER_FEE_RATE).abs() < 1e-15);
+        assert!((exit_fee - 113.1184125 * 0.25 * TAKER_FEE_RATE).abs() < 1e-15);
+        assert!(
+            (t.pnl - 3.213_811_021_875).abs() < 1e-9,
+            "net pnl literal, got {}",
+            t.pnl
+        );
+        assert!((out.final_equity - 203.213_811_021_875).abs() < 1e-9);
     }
 
     #[test]
