@@ -301,7 +301,10 @@ mod tests {
         let t = &out.trades[0];
         assert_eq!(t.exit_reason, ExitReason::Target);
         assert!((t.qty - 0.25).abs() < 1e-9);
-        assert!((t.entry_price - 100.05).abs() < 1e-9, "entry fill incl. slippage");
+        assert!(
+            (t.entry_price - 100.05).abs() < 1e-9,
+            "entry fill incl. slippage"
+        );
         assert!(
             (t.exit_price - 113.1184125).abs() < 1e-9,
             "target exit fill incl. slippage"

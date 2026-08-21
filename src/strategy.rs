@@ -56,7 +56,10 @@ impl StrategyConfig {
             ("atr_period".into(), s.atr_period.to_string()),
             ("ema_fast".into(), s.ema_fast.to_string()),
             ("ema_slow".into(), s.ema_slow.to_string()),
-            ("max_notional_pct_equity".into(), fx(b.max_notional_pct_equity)),
+            (
+                "max_notional_pct_equity".into(),
+                fx(b.max_notional_pct_equity),
+            ),
             ("min_notional_usd".into(), fx(b.min_notional_usd)),
             ("pairs".into(), s.pairs.join(",")),
             ("risk_per_trade_usd".into(), fx(b.risk_per_trade_usd)),
@@ -231,7 +234,8 @@ mod tests {
     }
 
     #[test]
-    fn config_parses_from_toml() {        let raw = r#"
+    fn config_parses_from_toml() {
+        let raw = r#"
 [strategy]
 name = "ema_rsi_pullback"
 pairs = ["BTCUSDT", "ETHUSDT"]

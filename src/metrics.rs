@@ -121,7 +121,10 @@ pub fn evaluate_gate(reports: &[PairReport]) -> GateVerdict {
 
     // "profitable OOS on >= 3 of N pairs", literally: thin pairs (< trade
     // floor) count as NOT profitable, so >=3 must hold among ALL evaluated
-    let profitable_pairs = qualifying.iter().filter(|r| r.metrics.net_pnl > 0.0).count();
+    let profitable_pairs = qualifying
+        .iter()
+        .filter(|r| r.metrics.net_pnl > 0.0)
+        .count();
     if profitable_pairs < GATE_MIN_PROFITABLE_PAIRS {
         reasons.push(format!(
             "{} profitable pairs (of {} evaluated) < {} required",
@@ -270,11 +273,9 @@ mod tests {
         // all five pairs below the trade-count floor -> zero qualifying pairs:
         // gate must fail explicitly instead of silently skipping the PF check
         let thin: Vec<PairReport> = (0..5)
-            .map(|i| {
-                PairReport {
-                    symbol: format!("P{i}"),
-                    metrics: compute(&(0..5).map(|_| tr(1.0)).collect::<Vec<_>>(), &[]),
-                }
+            .map(|i| PairReport {
+                symbol: format!("P{i}"),
+                metrics: compute(&(0..5).map(|_| tr(1.0)).collect::<Vec<_>>(), &[]),
             })
             .collect();
         let v = evaluate_gate(&thin);

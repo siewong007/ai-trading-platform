@@ -191,9 +191,7 @@ impl Db {
 
     /// Config hashes already recorded in backtest_runs — re-running any of
     /// these is free under the variant budget.
-    pub async fn known_config_hashes(
-        &self,
-    ) -> anyhow::Result<std::collections::HashSet<String>> {
+    pub async fn known_config_hashes(&self) -> anyhow::Result<std::collections::HashSet<String>> {
         let rows = sqlx::query("SELECT DISTINCT config_hash FROM backtest_runs")
             .fetch_all(&self.pool)
             .await?;
@@ -245,8 +243,7 @@ impl Db {
                 .await?
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
-            Self::config_set_in(&mut tx, "variant_budget_used", &(used + 1).to_string())
-                .await?;
+            Self::config_set_in(&mut tx, "variant_budget_used", &(used + 1).to_string()).await?;
         }
         for r in rows {
             sqlx::query("DELETE FROM backtest_runs WHERE config_hash=? AND symbol=?")
@@ -362,7 +359,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            scalar(&db, "SELECT COUNT(*) FROM backtest_runs WHERE config_hash='h1'").await,
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM backtest_runs WHERE config_hash='h1'"
+            )
+            .await,
             1
         );
         let pnl = sqlx::query("SELECT oos_pnl FROM backtest_runs WHERE config_hash='h1'")
@@ -372,7 +373,10 @@ mod tests {
             .get::<f64, _>(0);
         assert!((pnl - 2.0).abs() < 1e-9);
         assert_eq!(
-            db.config_get("variant_budget_used").await.unwrap().as_deref(),
+            db.config_get("variant_budget_used")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("1")
         );
     }
@@ -380,18 +384,31 @@ mod tests {
     #[tokio::test]
     async fn budget_charged_once_per_distinct_hash() {
         let db = mem_db().await;
-        db.record_backtest_results("h1", &[br_row("A", 1.0)]).await.unwrap();
-        db.record_backtest_results("h2", &[br_row("A", 2.0)]).await.unwrap();
-        db.record_backtest_results("h1", &[br_row("B", 3.0)]).await.unwrap(); // free rerun
+        db.record_backtest_results("h1", &[br_row("A", 1.0)])
+            .await
+            .unwrap();
+        db.record_backtest_results("h2", &[br_row("A", 2.0)])
+            .await
+            .unwrap();
+        db.record_backtest_results("h1", &[br_row("B", 3.0)])
+            .await
+            .unwrap(); // free rerun
         assert_eq!(
-            db.config_get("variant_budget_used").await.unwrap().as_deref(),
+            db.config_get("variant_budget_used")
+                .await
+                .unwrap()
+                .as_deref(),
             Some("2")
         );
         assert_eq!(db.distinct_config_count().await.unwrap(), 2);
         assert_eq!(db.known_config_hashes().await.unwrap().len(), 2);
         // h1 now has rows for both symbols (A from first run, B from rerun)
         assert_eq!(
-            scalar(&db, "SELECT COUNT(*) FROM backtest_runs WHERE config_hash='h1'").await,
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM backtest_runs WHERE config_hash='h1'"
+            )
+            .await,
             2
         );
     }
