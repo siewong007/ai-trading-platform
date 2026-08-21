@@ -70,6 +70,30 @@ pub struct MyTrade {
     pub time: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)] // Phase 2 (executor) consumes these
+pub struct PlacedOrder {
+    pub order_id: i64,
+    pub client_order_id: String,
+    pub status: String,
+    pub executed_qty: f64,
+}
+
+pub fn round_qty_to_step(qty: f64, step_size: f64) -> f64 {
+    ((qty / step_size).floor() * step_size * 1e8).round() / 1e8
+}
+
+fn fmt_price(x: f64) -> String {
+    let mut s = format!("{x:.8}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.push('0');
+    }
+    s
+}
+
 pub struct SignedClient {
     http: reqwest::Client,
     base: String,
@@ -125,21 +149,7 @@ impl SignedClient {
             .signed_get("/api/v3/openOrders", &[("symbol", symbol)])
             .await?;
         let raw: Vec<RawOpenOrder> = serde_json::from_str(&body)?;
-        raw.into_iter()
-            .map(|o| {
-                Ok(OpenOrder {
-                    order_id: o.order_id,
-                    client_order_id: o.client_order_id,
-                    symbol: o.symbol,
-                    side: o.side,
-                    otype: o.otype,
-                    price: o.price.parse()?,
-                    orig_qty: o.orig_qty.parse()?,
-                    executed_qty: o.executed_qty.parse()?,
-                    status: o.status,
-                })
-            })
-            .collect()
+        raw.into_iter().map(convert_open_order).collect()
     }
 
     #[allow(dead_code)] // Phase 2 (executor) consumes this
@@ -219,6 +229,119 @@ impl SignedClient {
         })
     }
 
+    #[allow(dead_code)] // Phase 2 (executor) consumes this
+    pub async fn place_limit_buy(
+        &self,
+        symbol: &str,
+        qty: f64,
+        price: f64,
+        client_id: &str,
+    ) -> anyhow::Result<PlacedOrder> {
+        let qty_str = fmt_price(qty);
+        let price_str = fmt_price(price);
+        let body = self
+            .signed_post(
+                "/api/v3/order",
+                &[
+                    ("symbol", symbol),
+                    ("side", "BUY"),
+                    ("type", "LIMIT"),
+                    ("timeInForce", "GTC"),
+                    ("quantity", qty_str.as_str()),
+                    ("price", price_str.as_str()),
+                    ("newClientOrderId", client_id),
+                ],
+            )
+            .await?;
+        placed_order_from(&body)
+    }
+
+    #[allow(dead_code)] // Phase 2 (executor) consumes this
+    pub async fn place_oco_sell(
+        &self,
+        symbol: &str,
+        qty: f64,
+        tp_price: f64,
+        stop_price: f64,
+        list_client_id: &str,
+    ) -> anyhow::Result<String> {
+        let qty_str = fmt_price(qty);
+        let tp = fmt_price(tp_price);
+        let stop = fmt_price(stop_price);
+        let below = fmt_price((stop_price * 0.995 * 1e8).round() / 1e8);
+        let body = self
+            .signed_post(
+                "/api/v3/order/oco",
+                &[
+                    ("symbol", symbol),
+                    ("side", "SELL"),
+                    ("quantity", qty_str.as_str()),
+                    ("listClientOrderId", list_client_id),
+                    ("aboveType", "LIMIT_MAKER"),
+                    ("abovePrice", tp.as_str()),
+                    ("belowType", "STOP_LOSS_LIMIT"),
+                    ("belowStopPrice", stop.as_str()),
+                    ("belowPrice", below.as_str()),
+                ],
+            )
+            .await?;
+        let raw: RawOcoResponse = serde_json::from_str(&body)?;
+        Ok(raw.order_list_id.to_string())
+    }
+
+    #[allow(dead_code)] // Phase 2 (executor) consumes this
+    pub async fn cancel_all_orders(&self, symbol: &str) -> anyhow::Result<()> {
+        match self
+            .signed_delete("/api/v3/openOrders", &[("symbol", symbol)])
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("-2011") || msg.to_lowercase().contains("order list is empty") {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    #[allow(dead_code)] // Phase 2 (executor) consumes this
+    pub async fn market_sell(
+        &self,
+        symbol: &str,
+        qty: f64,
+        client_id: &str,
+    ) -> anyhow::Result<PlacedOrder> {
+        let qty_str = fmt_price(qty);
+        let body = self
+            .signed_post(
+                "/api/v3/order",
+                &[
+                    ("symbol", symbol),
+                    ("side", "SELL"),
+                    ("type", "MARKET"),
+                    ("quantity", qty_str.as_str()),
+                    ("newClientOrderId", client_id),
+                ],
+            )
+            .await?;
+        placed_order_from(&body)
+    }
+
+    #[allow(dead_code)] // Phase 2 (executor) consumes this
+    pub async fn get_order(&self, symbol: &str, client_order_id: &str) -> anyhow::Result<OpenOrder> {
+        let body = self
+            .signed_get(
+                "/api/v3/order",
+                &[("symbol", symbol), ("origClientOrderId", client_order_id)],
+            )
+            .await?;
+        let raw: RawOpenOrder = serde_json::from_str(&body)?;
+        convert_open_order(raw)
+    }
+
     async fn request(
         &self,
         method: reqwest::Method,
@@ -260,6 +383,45 @@ impl SignedClient {
 #[derive(Deserialize)]
 struct RawAccount {
     balances: Vec<RawBalance>,
+}
+
+fn convert_open_order(o: RawOpenOrder) -> anyhow::Result<OpenOrder> {
+    Ok(OpenOrder {
+        order_id: o.order_id,
+        client_order_id: o.client_order_id,
+        symbol: o.symbol,
+        side: o.side,
+        otype: o.otype,
+        price: o.price.parse()?,
+        orig_qty: o.orig_qty.parse()?,
+        executed_qty: o.executed_qty.parse()?,
+        status: o.status,
+    })
+}
+
+fn placed_order_from(body: &str) -> anyhow::Result<PlacedOrder> {
+    let raw: RawPlacedOrder = serde_json::from_str(body)?;
+    Ok(PlacedOrder {
+        order_id: raw.order_id,
+        client_order_id: raw.client_order_id,
+        status: raw.status,
+        executed_qty: raw.executed_qty.parse()?,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPlacedOrder {
+    order_id: i64,
+    client_order_id: String,
+    status: String,
+    executed_qty: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawOcoResponse {
+    order_list_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -614,6 +776,189 @@ mod tests {
 
         let missing = SignedClient::symbol_filters(&server.uri(), "DOGEUSDT").await;
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn round_qty_to_step_floors_to_step_eight_decimals_safe() {
+        assert_eq!(round_qty_to_step(0.123456789, 0.0001), 0.1234);
+        assert_eq!(round_qty_to_step(0.05, 0.001), 0.05);
+        assert_eq!(round_qty_to_step(0.9999999, 0.001), 0.999);
+    }
+
+    #[test]
+    fn fmt_price_no_exponent_trailing_zeros_trimmed() {
+        assert_eq!(fmt_price(40_000.0), "40000.0");
+        assert_eq!(fmt_price(101.5), "101.5");
+        assert_eq!(fmt_price(97.75875), "97.75875");
+    }
+
+    #[tokio::test]
+    async fn place_limit_buy_posts_params_and_client_id_passthrough() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/order"))
+            .and(query_param("symbol", "BTCUSDT"))
+            .and(query_param("side", "BUY"))
+            .and(query_param("type", "LIMIT"))
+            .and(query_param("timeInForce", "GTC"))
+            .and(query_param("quantity", "0.01"))
+            .and(query_param("price", "40000.0"))
+            .and(query_param("newClientOrderId", "tp-entry-1700"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"symbol":"BTCUSDT","orderId":4293153,"clientOrderId":"tp-entry-1700",
+                "status":"NEW","executedQty":"0.00000000"}"#,
+            ))
+            .mount(&server)
+            .await;
+        let client = signed_client(&server.uri());
+        let o = client
+            .place_limit_buy("BTCUSDT", 0.01, 40_000.0, "tp-entry-1700")
+            .await
+            .unwrap();
+        assert_eq!(o.order_id, 4_293_153);
+        assert_eq!(o.client_order_id, "tp-entry-1700");
+        assert_eq!(o.status, "NEW");
+        assert_eq!(o.executed_qty, 0.0);
+
+        let reqs = server.received_requests().await.unwrap();
+        let query = reqs[0].url.query().unwrap();
+        let (prefix, sig) = query.split_once("&signature=").unwrap();
+        assert_eq!(sig, sign_query(SECRET, prefix));
+    }
+
+    #[tokio::test]
+    async fn place_oco_sell_sends_exact_legs_and_returns_list_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/order/oco"))
+            .and(query_param("symbol", "BTCUSDT"))
+            .and(query_param("side", "SELL"))
+            .and(query_param("quantity", "0.01"))
+            .and(query_param("aboveType", "LIMIT_MAKER"))
+            .and(query_param("abovePrice", "101.5"))
+            .and(query_param("belowType", "STOP_LOSS_LIMIT"))
+            .and(query_param("belowStopPrice", "98.25"))
+            .and(query_param("belowPrice", "97.75875"))
+            .and(query_param("listClientOrderId", "tp-oco-1700"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"orderListId":12345,"contingencyType":"OCO","listStatusType":"EXEC_STARTED",
+                "listOrderStatus":"EXECUTING","listClientOrderId":"tp-oco-1700",
+                "symbol":"BTCUSDT","orders":[]}"#,
+            ))
+            .mount(&server)
+            .await;
+        let client = signed_client(&server.uri());
+        let list_id = client
+            .place_oco_sell("BTCUSDT", 0.01, 101.5, 98.25, "tp-oco-1700")
+            .await
+            .unwrap();
+        assert_eq!(list_id, "12345");
+
+        let reqs = server.received_requests().await.unwrap();
+        let query = reqs[0].url.query().unwrap();
+        assert!(
+            !query.contains("e-") && !query.contains("e+"),
+            "prices must be formatted without exponent notation: {query}"
+        );
+        let (prefix, sig) = query.split_once("&signature=").unwrap();
+        assert_eq!(sig, sign_query(SECRET, prefix));
+    }
+
+    #[tokio::test]
+    async fn cancel_all_orders_ok_on_empty_and_on_binance_empty_list_error() {
+        let ok_server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v3/openOrders"))
+            .and(query_param("symbol", "BTCUSDT"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+            .mount(&ok_server)
+            .await;
+        signed_client(&ok_server.uri())
+            .cancel_all_orders("BTCUSDT")
+            .await
+            .unwrap();
+
+        let binance_empty = MockServer::start().await;
+        Mock::given(method("DELETE")).respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"code":-2011,"msg":"Order list is empty."}"#,
+        ))
+            .mount(&binance_empty)
+            .await;
+        signed_client(&binance_empty.uri())
+            .cancel_all_orders("BTCUSDT")
+            .await
+            .unwrap();
+
+        let other_err = MockServer::start().await;
+        Mock::given(method("DELETE")).respond_with(ResponseTemplate::new(500)
+            .set_body_string(r#"{"code":-1000,"msg":"Internal error."}"#))
+            .mount(&other_err)
+            .await;
+        let err = signed_client(&other_err.uri())
+            .cancel_all_orders("BTCUSDT")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("-1000"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn market_sell_posts_market_params_and_parses_fill() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/order"))
+            .and(query_param("symbol", "ETHUSDT"))
+            .and(query_param("side", "SELL"))
+            .and(query_param("type", "MARKET"))
+            .and(query_param("quantity", "0.05"))
+            .and(query_param("newClientOrderId", "tp-flatten-1700"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"symbol":"ETHUSDT","orderId":4293154,"clientOrderId":"tp-flatten-1700",
+                "status":"FILLED","executedQty":"0.05000000"}"#,
+            ))
+            .mount(&server)
+            .await;
+        let o = signed_client(&server.uri())
+            .market_sell("ETHUSDT", 0.05, "tp-flatten-1700")
+            .await
+            .unwrap();
+        assert_eq!(o.order_id, 4_293_154);
+        assert_eq!(o.client_order_id, "tp-flatten-1700");
+        assert_eq!(o.status, "FILLED");
+        assert_eq!(o.executed_qty, 0.05);
+    }
+
+    #[tokio::test]
+    async fn get_order_queries_by_orig_client_order_id_and_parses() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v3/order"))
+            .and(query_param("symbol", "BTCUSDT"))
+            .and(query_param("origClientOrderId", "tp-entry-1700"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"symbol":"BTCUSDT","orderId":4293153,"orderListId":-1,
+                "clientOrderId":"tp-entry-1700","price":"40000.00000000",
+                "origQty":"0.01000000","executedQty":"0.01000000",
+                "cummulativeQuoteQty":"400.00000000","status":"FILLED",
+                "timeInForce":"GTC","type":"LIMIT","side":"BUY",
+                "stopPrice":"0.00000000","icebergQty":"0.00000000",
+                "time":1499827319559,"updateTime":1499827319559,
+                "isWorking":true,"origQuoteOrderQty":"0.40000000"}"#,
+            ))
+            .mount(&server)
+            .await;
+        let o = signed_client(&server.uri())
+            .get_order("BTCUSDT", "tp-entry-1700")
+            .await
+            .unwrap();
+        assert_eq!(o.order_id, 4_293_153);
+        assert_eq!(o.client_order_id, "tp-entry-1700");
+        assert_eq!(o.symbol, "BTCUSDT");
+        assert_eq!(o.side, "BUY");
+        assert_eq!(o.otype, "LIMIT");
+        assert_eq!(o.price, 40_000.0);
+        assert_eq!(o.orig_qty, 0.01);
+        assert_eq!(o.executed_qty, 0.01);
+        assert_eq!(o.status, "FILLED");
     }
 
     fn keys_err(result: anyhow::Result<Keys>) -> String {
