@@ -102,7 +102,8 @@ impl Db {
 
     pub async fn open_default() -> anyhow::Result<Self> {
         std::fs::create_dir_all("data")?;
-        Self::open("sqlite://data/trading.db").await
+        // mode=rwc: sqlx will not create the file otherwise (code 14 if absent)
+        Self::open("sqlite://data/trading.db?mode=rwc").await
     }
 
     pub async fn upsert_klines(
@@ -280,6 +281,31 @@ mod tests {
 
     async fn mem_db() -> Db {
         Db::open("sqlite::memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn file_db_creates_and_roundtrips() {
+        let path = std::env::temp_dir().join(format!("tp_probe_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // file does not exist yet — open must create it (mode=rwc)
+        let db = Db::open(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        let c = Candle {
+            open_time: 1,
+            open: 1.0,
+            high: 2.0,
+            low: 0.5,
+            close: 1.5,
+            volume: 3.0,
+        };
+        db.upsert_klines("TESTUSDT", "1h", &[c]).await.unwrap();
+        assert!(path.exists());
+        let loaded = db.load_klines("TESTUSDT", "1h").await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!((loaded[0].close - 1.5).abs() < 1e-9);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
