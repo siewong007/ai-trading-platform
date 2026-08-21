@@ -35,7 +35,11 @@ pub struct BacktestSection {
 impl StrategyConfig {
     pub fn load(path: &str) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&raw)?)
+        Self::load_from_toml_str(&raw)
+    }
+
+    pub fn load_from_toml_str(raw: &str) -> anyhow::Result<Self> {
+        Ok(toml::from_str(raw)?)
     }
 }
 
