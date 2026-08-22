@@ -11,6 +11,10 @@ remains the kill switch (still requires typed `GO`). Testnet is the sanctioned
 engine stage. Variant budget: 12/20 used; remaining 8 are reserved — do not
 run `search --unlock-new-study` on this OOS window.
 
+An agent/orchestrator may run `scripts/lab.sh` (`fetch` + `backtest` only) to
+speed measurement. It must not call `trade`, `flatten`, or
+`search --unlock-new-study`. There is no LLM in the trade path (spec §11).
+
 ## 1. API key creation checklist (verbatim spec §7)
 
 > Binance API key: **spot trading enabled, withdrawals disabled,

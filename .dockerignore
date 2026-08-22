@@ -1,0 +1,6 @@
+target
+.git
+.worktrees
+data
+.env
+.superpowers

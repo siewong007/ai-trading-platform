@@ -1,0 +1,12 @@
+# Research-only container usage (freeze spec 2026-08-22: live is refused in code).
+# Examples:
+#   docker compose run --rm app fetch
+#   docker compose run --rm app backtest
+#   docker compose run --rm app search
+services:
+  app:
+    build: .
+    image: ghcr.io/siewong007/trading_platform:${TAG:-local}
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro

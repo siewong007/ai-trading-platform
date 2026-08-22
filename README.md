@@ -25,6 +25,7 @@ Testnet-first: `trade` defaults to `https://testnet.binance.vision`.
 | `export --out FILE.csv` | trades table → CSV (tax records) |
 | `trade [--once] [--dry-run] [--testnet\|--live]` | executor loop (testnet default; `--live` requires stored PASS then `GO`) |
 | `flatten` | kill switch: cancel all → confirm → market-reduce → verify |
+| `scripts/lab.sh` | lab tech: `fetch` + `backtest` only (no search, no trade, no LLM) |
 
 ## Quickstart
 
