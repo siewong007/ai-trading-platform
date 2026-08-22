@@ -390,12 +390,17 @@ impl SignedClient {
     ) -> anyhow::Result<String> {
         match self.request_once(method.clone(), path, params).await {
             Err(e) if e.to_string().starts_with("binance error -1021") => {
-                // clock skew: resync against server time and retry once
-                let now = self.server_time_ms().await.unwrap_or_default();
-                self.time_skew_ms.store(
-                    now - chrono::Utc::now().timestamp_millis(),
-                    Ordering::Relaxed,
-                );
+                // clock skew: resync against server time and retry once.
+                // Only adopt a plausible offset — a failed probe must not
+                // poison every later timestamp.
+                if let Ok(now) = self.server_time_ms().await {
+                    if now > 0 {
+                        self.time_skew_ms.store(
+                            now - chrono::Utc::now().timestamp_millis(),
+                            Ordering::Relaxed,
+                        );
+                    }
+                }
                 self.request_once(method, path, params).await
             }
             other => other,

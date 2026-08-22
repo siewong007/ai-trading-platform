@@ -260,10 +260,15 @@ impl Executor {
                     // dust remainder: treat position as closed on realized exits
                     tracing::warn!("{pair}: only dust left ({remaining}) — closing state");
                 }
+                if exit_qty <= 0.0 {
+                    tracing::warn!("{pair}: no realized exits yet — keeping state");
+                    return Ok(CycleOutcome::PositionLive);
+                }
                 let exit_notional: f64 = exits.iter().map(|t| t.price * t.qty).sum();
                 let fees: f64 = exits.iter().map(|t| t.commission).sum();
                 let avg_exit = exit_notional / exit_qty;
-                let pnl = (avg_exit - pos.entry_price) * pos.qty - fees;
+                // book PnL over what actually exited, not the original size
+                let pnl = (avg_exit - pos.entry_price) * exit_qty - fees;
                 let was_stopout = avg_exit <= pos.stop * 1.001;
                 let mut day = load_day_state(&self.db, &self.hash).await?;
                 register_result(&mut day, pnl, was_stopout);
