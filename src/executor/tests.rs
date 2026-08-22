@@ -1,5 +1,5 @@
 use super::*;
-use crate::signed::fmt_price;
+use crate::signed::{fmt_price, Keys};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
