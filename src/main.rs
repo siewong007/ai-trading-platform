@@ -6,6 +6,7 @@ mod exchange;
 mod executor;
 mod indicators;
 mod metrics;
+mod pipeline;
 mod risk;
 mod signed;
 mod strategy;

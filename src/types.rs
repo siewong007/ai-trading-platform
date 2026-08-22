@@ -1,6 +1,8 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Canonical wire contract for bus payloads on topic `kline.<SYMBOL>`:
+/// serde JSON of this struct exactly (field names are the contract).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Candle {
     pub open_time: i64,
     pub open: f64,

@@ -43,9 +43,7 @@ pub fn parse_kline_frame(frame: &str) -> Option<(String, Candle)> {
 
 fn decode(frame: &str) -> anyhow::Result<Option<(String, Candle)>> {
     let v: serde_json::Value = serde_json::from_str(frame)?;
-    let k = v
-        .pointer("/data/k")
-        .context("frame has no data.k object")?;
+    let k = v.pointer("/data/k").context("frame has no data.k object")?;
     if k.get("x").and_then(serde_json::Value::as_bool) != Some(true) {
         return Ok(None); // candle not closed yet
     }
