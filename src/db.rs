@@ -221,9 +221,44 @@ impl Db {
             .await?;
         Ok(row.get::<i64, _>("n") as u32)
     }
+
+    /// Overall gate verdict of the most recently recorded backtest_runs
+    /// config (spec §5 thresholds recomputed from the stored OOS metrics);
+    /// None when nothing is on record.
+    pub async fn latest_search_overall_verdict(&self) -> anyhow::Result<Option<bool>> {
+        use std::collections::HashMap;
+        let rows = sqlx::query(
+            "SELECT config_hash,symbol,oos_trades,oos_pf,oos_pnl,oos_dd
+             FROM backtest_runs ORDER BY ran_at DESC, id DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut order: Vec<String> = Vec::new();
+        let mut by_hash: HashMap<String, Vec<crate::metrics::PairReport>> = HashMap::new();
+        for r in rows {
+            let hash: String = r.get("config_hash");
+            if !by_hash.contains_key(&hash) {
+                order.push(hash.clone());
+            }
+            by_hash.entry(hash).or_default().push(crate::metrics::PairReport {
+                symbol: r.get("symbol"),
+                metrics: crate::metrics::Metrics {
+                    total_trades: r.get::<i64, _>("oos_trades").max(0) as usize,
+                    profit_factor: r.get("oos_pf"),
+                    win_rate: 0.0,
+                    net_pnl: r.get("oos_pnl"),
+                    max_drawdown_pct: r.get("oos_dd"),
+                },
+            });
+        }
+        Ok(order
+            .first()
+            .map(|h| crate::metrics::evaluate_gate(&by_hash[h]).pass))
+    }
 }
 
 /// One OOS result row recorded for a backtested config on one symbol.
+#[derive(Clone)]
 #[derive(Debug)]
 pub struct BacktestRunRow {
     pub symbol: String,

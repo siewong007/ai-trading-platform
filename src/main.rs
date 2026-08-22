@@ -16,6 +16,8 @@ use exchange::Exchange;
 use metrics::{
     evaluate_gate, max_drawdown_pct, GateVerdict, Metrics, PairReport, GATE_MAX_VARIANTS,
 };
+use executor::{CycleOutcome, Executor};
+use signed::{Keys, SignedClient};
 use strategy::{BacktestSection, StrategyConfig, StrategySection};
 use types::Candle;
 
@@ -48,9 +50,32 @@ enum Command {
         #[arg(long, default_value = "data/trades_export.csv")]
         out: String,
     },
+    /// Run the executor loop (TESTNET default; --live requires typed GO)
+    Trade {
+        #[arg(long, default_value = "config/strategy_ema_rsi.toml")]
+        config: String,
+        #[arg(long)]
+        testnet: bool,
+        #[arg(long)]
+        live: bool,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        once: bool,
+    },
+    /// Kill switch: cancel all orders, market-reduce, halt until manual reset
+    Flatten {
+        #[arg(long, default_value = "config/strategy_ema_rsi.toml")]
+        config: String,
+        #[arg(long)]
+        testnet: bool,
+        #[arg(long)]
+        live: bool,
+    },
 }
 
 const BINANCE_BASE: &str = "https://api.binance.com";
+const TESTNET_BASE: &str = "https://testnet.binance.vision";
 /// ~18 months of hourly candles worth of lookback (spec §5)
 const LOOKBACK_DAYS: i64 = 550;
 const IS_FRACTION: f64 = 0.70;
@@ -69,7 +94,173 @@ fn main() -> anyhow::Result<()> {
         Command::Backtest { config } => rt.block_on(run_backtest(&config))?,
         Command::Search { config } => rt.block_on(run_search(&config))?,
         Command::Export { out } => rt.block_on(run_export(&out))?,
+        Command::Trade {
+            config,
+            testnet,
+            live,
+            dry_run,
+            once,
+        } => {
+            let base = select_base(testnet, live)?;
+            rt.block_on(run_trade(&config, base, dry_run, once))?
+        }
+        Command::Flatten {
+            config,
+            testnet,
+            live,
+        } => {
+            let base = select_base(testnet, live)?;
+            rt.block_on(run_flatten(&config, base))?
+        }
     }
+    Ok(())
+}
+
+fn select_base(testnet: bool, live: bool) -> anyhow::Result<&'static str> {
+    anyhow::ensure!(
+        !(testnet && live),
+        "--testnet and --live are mutually exclusive"
+    );
+    Ok(if live { BINANCE_BASE } else { TESTNET_BASE })
+}
+
+fn gate_banner(latest_pass: Option<bool>) -> String {
+    match latest_pass {
+        None => "gate verdict on record: NO GATE RESULT ON RECORD".to_string(),
+        Some(false) => "latest stored search OVERALL verdict: FAIL\n\
+                        PRE-REGISTERED GATE VERDICT: NO-GO — running against spec §5 advice"
+            .to_string(),
+        Some(true) => "latest stored search OVERALL verdict: GO (pre-registered gate PASS on record)"
+            .to_string(),
+    }
+}
+
+fn confirm_live_input(input: &str) -> bool {
+    input.trim() == "GO"
+}
+
+fn confirm_live(latest_pass: Option<bool>) -> anyhow::Result<()> {
+    println!("{}", gate_banner(latest_pass));
+    println!("LIVE mode trades real funds. Type GO to continue:");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    anyhow::ensure!(
+        confirm_live_input(&line),
+        "aborted: live trading requires the literal word GO on stdin"
+    );
+    Ok(())
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+async fn telegram_send(text: &str) -> anyhow::Result<()> {
+    let token = std::env::var("TELEGRAM_BOT_TOKEN")?;
+    let chat_id = std::env::var("TELEGRAM_CHAT_ID")?;
+    let sanitize = |e: reqwest::Error| {
+        // without_url: never leak the bot token embedded in request URLs
+        anyhow::anyhow!("telegram request failed: {}", e.without_url())
+    };
+    let resp = reqwest::Client::new()
+        .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+        .json(&serde_json::json!({ "chat_id": chat_id, "text": text }))
+        .send()
+        .await
+        .map_err(sanitize)?;
+    resp.error_for_status().map_err(sanitize)?;
+    Ok(())
+}
+
+async fn notify(text: &str) {
+    if std::env::var("TELEGRAM_BOT_TOKEN").is_err()
+        || std::env::var("TELEGRAM_CHAT_ID").is_err()
+    {
+        return;
+    }
+    if let Err(e) = telegram_send(text).await {
+        tracing::warn!("telegram notify failed: {e:#}");
+    }
+}
+
+async fn run_trade(config_path: &str, base: &str, dry_run: bool, once: bool) -> anyhow::Result<()> {
+    let cfg = StrategyConfig::load(config_path)?;
+    let db = Db::open_default().await?;
+    let verdict = db.latest_search_overall_verdict().await?;
+    println!("{}", gate_banner(verdict));
+    if base == BINANCE_BASE {
+        confirm_live(verdict)?;
+    }
+    let ex = Executor {
+        sc: SignedClient::new(base, Keys::from_env()?)?,
+        db,
+        strat: cfg.strategy.clone(),
+        bt: cfg.backtest.clone(),
+        hash: cfg.config_hash(),
+        dry_run,
+    };
+    let reconcile = ex.reconcile().await?;
+    tracing::info!("{reconcile}");
+    notify(&format!("trade started ({base})\n{reconcile}")).await;
+    let mut cycle: u64 = 0;
+    loop {
+        cycle += 1;
+        match ex.run_cycle(now_ms()).await {
+            Ok(outcome) => {
+                let open = matches!(
+                    outcome,
+                    CycleOutcome::PlacedEntry { .. }
+                        | CycleOutcome::AwaitingFill
+                        | CycleOutcome::PlacedOco { .. }
+                        | CycleOutcome::PositionLive
+                );
+                tracing::info!(
+                    "heartbeat alive cycle={cycle} pos={}",
+                    if open { "open" } else { "flat" }
+                );
+                if once {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::error!("cycle {cycle} failed: {e:#}");
+                notify(&format!("trade cycle {cycle} error: {e:#}")).await;
+            }
+        }
+        let day = risk::load_day_state(&ex.db, &ex.hash).await?;
+        if day.halted {
+            let reason = day.halt_reason.unwrap_or_else(|| "unspecified".into());
+            tracing::warn!("HALT: {reason} — exiting until manual reset");
+            notify(&format!("HALT: {reason} — engine stopped")).await;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+    Ok(())
+}
+
+async fn run_flatten(config_path: &str, base: &str) -> anyhow::Result<()> {
+    let cfg = StrategyConfig::load(config_path)?;
+    let db = Db::open_default().await?;
+    let verdict = db.latest_search_overall_verdict().await?;
+    println!("{}", gate_banner(verdict));
+    if base == BINANCE_BASE {
+        confirm_live(verdict)?;
+    }
+    let ex = Executor {
+        sc: SignedClient::new(base, Keys::from_env()?)?,
+        db,
+        strat: cfg.strategy.clone(),
+        bt: cfg.backtest.clone(),
+        hash: cfg.config_hash(),
+        dry_run: false,
+    };
+    let report = ex.flatten_all().await?;
+    println!("{report}");
+    notify(&format!("FLATTEN executed ({base}):\n{report}")).await;
     Ok(())
 }
 
@@ -379,5 +570,138 @@ mod tests {
         // the 21st DISTINCT hash is refused before any work happens
         let err = check_variant_budget(GATE_MAX_VARIANTS, true).unwrap_err();
         assert!(err.to_string().contains("budget"), "{err}");
+    }
+
+    #[test]
+    fn trade_subcommand_parses_all_flags_with_testnet_default() {
+        let cli = Cli::try_parse_from(["tp", "trade", "--config", "c.toml"]).unwrap();
+        match cli.command {
+            Command::Trade {
+                config,
+                testnet,
+                live,
+                dry_run,
+                once,
+            } => {
+                assert_eq!(config, "c.toml");
+                assert!(!testnet);
+                assert!(!live);
+                assert!(!dry_run);
+                assert!(!once);
+            }
+            _ => panic!("expected Trade"),
+        }
+        let cli = Cli::try_parse_from([
+            "tp",
+            "trade",
+            "--config",
+            "c.toml",
+            "--live",
+            "--dry-run",
+            "--once",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Trade {
+                testnet, live, ..
+            } => {
+                assert!(!testnet);
+                assert!(live);
+            }
+            _ => panic!("expected Trade"),
+        }
+    }
+
+    #[test]
+    fn flatten_subcommand_parses_flags() {
+        let cli = Cli::try_parse_from(["tp", "flatten", "--live"]).unwrap();
+        match cli.command {
+            Command::Flatten { testnet, live, .. } => {
+                assert!(!testnet);
+                assert!(live);
+            }
+            _ => panic!("expected Flatten"),
+        }
+    }
+
+    #[test]
+    fn base_selection_defaults_to_testnet_and_rejects_conflicting_flags() {
+        assert_eq!(select_base(false, false).unwrap(), TESTNET_BASE);
+        assert_eq!(select_base(true, false).unwrap(), TESTNET_BASE);
+        assert_eq!(select_base(false, true).unwrap(), BINANCE_BASE);
+        assert!(select_base(true, true).is_err());
+    }
+
+    #[test]
+    fn gate_banner_shows_no_go_on_fail_and_no_gate_result_when_empty() {
+        assert!(gate_banner(None).contains("NO GATE RESULT"));
+        let fail = gate_banner(Some(false));
+        assert!(fail.contains("NO-GO"), "{fail}");
+        assert!(fail.contains("PRE-REGISTERED GATE VERDICT"));
+        assert!(!gate_banner(Some(true)).contains("NO-GO"));
+    }
+
+    #[test]
+    fn live_confirmation_requires_the_literal_word_go() {
+        assert!(!confirm_live_input("no\n"));
+        assert!(!confirm_live_input("go\n"));
+        assert!(!confirm_live_input(""));
+        assert!(!confirm_live_input("GO GO\n"));
+        assert!(confirm_live_input("GO\n"));
+        assert!(confirm_live_input("GO"));
+    }
+
+    async fn memory_db() -> Db {
+        Db::open("sqlite::memory:").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn latest_verdict_is_none_when_table_empty_then_reflects_newest_run() {
+        let db = memory_db().await;
+        assert_eq!(db.latest_search_overall_verdict().await.unwrap(), None);
+
+        let fail_row = BacktestRunRow {
+            symbol: "BTCUSDT".into(),
+            rsi_entry: 30.0,
+            atr_mult: 2.0,
+            rr: 2.0,
+            oos_trades: 25,
+            oos_pf: 0.9,
+            oos_pnl: -50.0,
+            oos_dd: 12.0,
+        };
+        db.record_backtest_results("fail-hash", &[fail_row.clone()])
+            .await
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        db.record_backtest_results("fail-hash-2", &[fail_row])
+            .await
+            .unwrap();
+        assert_eq!(
+            db.latest_search_overall_verdict().await.unwrap(),
+            Some(false)
+        );
+
+        let pass_rows: Vec<BacktestRunRow> = ["ETHUSDT", "SOLUSDT", "ADAUSDT"]
+            .iter()
+            .map(|s| BacktestRunRow {
+                symbol: s.to_string(),
+                rsi_entry: 30.0,
+                atr_mult: 2.0,
+                rr: 2.0,
+                oos_trades: 25,
+                oos_pf: 2.0,
+                oos_pnl: 10.0,
+                oos_dd: 5.0,
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        db.record_backtest_results("pass-hash", &pass_rows)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.latest_search_overall_verdict().await.unwrap(),
+            Some(true)
+        );
     }
 }
