@@ -5,9 +5,11 @@ fully once before the first testnet run.
 
 ## 0. Status warning
 
-The pre-registered gate verdict is **NO-GO**. Per spec §5, live trading is NOT
-advised; every `trade`/`flatten` launch prints the stored verdict banner.
-Testnet use is the sanctioned stage until a PASS gate exists on record.
+The pre-registered gate verdict is **NO-GO**. `trade --live` exits non-zero
+until a stored overall PASS exists (`GO` cannot override). `flatten --live`
+remains the kill switch (still requires typed `GO`). Testnet is the sanctioned
+engine stage. Variant budget: 12/20 used; remaining 8 are reserved — do not
+run `search --unlock-new-study` on this OOS window.
 
 ## 1. API key creation checklist (verbatim spec §7)
 

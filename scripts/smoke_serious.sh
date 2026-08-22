@@ -63,9 +63,10 @@ echo "$OUT" | grep -q "missing env var BINANCE_API_KEY"
 check $? "trade without keys names missing var"
 echo "$OUT" | grep -q "NO-GO"
 check $? "gate banner precedes key check"
-OUT=$(printf 'no\n' | env BINANCE_API_KEY=fake BINANCE_API_SECRET=fake $BIN trade --once --live 2>&1)
+OUT=$(env BINANCE_API_KEY=fake BINANCE_API_SECRET=fake $BIN trade --once --live 2>&1)
 echo "$OUT" | grep -qi "NO-GO"; check $? "live gate banner shows NO-GO"
-echo "$OUT" | grep -qi "abort\|refus\|cancel"; check $? "non-GO answer aborts live mode"
+echo "$OUT" | grep -q "live trading refused until a stored overall gate PASS exists"
+check $? "live refused in code without GO prompt"
 OUT=$(env -u BINANCE_API_KEY -u BINANCE_API_SECRET $BIN flatten 2>&1)
 echo "$OUT" | grep -q "missing env var BINANCE_API_KEY"
 check $? "flatten without keys refused"
