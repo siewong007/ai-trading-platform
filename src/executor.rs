@@ -226,13 +226,16 @@ fn chrono_day(now_ms: i64) -> String {
     format!("day-{days}")
 }
 
-fn base_asset(symbol: &str) -> &str {
+fn base_asset(symbol: &str) -> anyhow::Result<&str> {
     for quote in ["USDT", "FDUSD", "USDC", "BUSD", "BTC", "ETH"] {
         if let Some(base) = symbol.strip_suffix(quote) {
-            return base;
+            if base.is_empty() {
+                break;
+            }
+            return Ok(base);
         }
     }
-    symbol
+    anyhow::bail!("cannot derive base asset from {symbol} — refusing to market-sell")
 }
 
 impl Executor {
@@ -242,8 +245,14 @@ impl Executor {
     pub async fn reconcile(&self) -> anyhow::Result<String> {
         let mut actions = Vec::new();
         let pos = self.load_pos().await?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let tf = timeframe_ms(&self.strat.timeframe);
         for pair in &self.strat.pairs {
             let open = self.sc.open_orders(pair).await?;
+            let filters = self.filters(pair).await?;
             let mut oco_live = false;
             for order in &open {
                 if !order.client_order_id.starts_with("tp-") {
@@ -254,9 +263,41 @@ impl Executor {
                     oco_live = true;
                     continue;
                 }
-                // orphan entry: BUY LIMIT with no protection placed yet
+                // tracked pending entry of a live position state: leave for run_cycle
+                if pos
+                    .as_ref()
+                    .map(|p| p.phase == ENTRY_PHASE && p.entry_client_id == order.client_order_id)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                // orphan age gate: candle time embedded in client id must be >2 candles old
+                let embedded_ts: i64 = order
+                    .client_order_id
+                    .rsplit('-')
+                    .next()
+                    .and_then(|t| t.parse().ok())
+                    .unwrap_or(i64::MAX);
+                if !is_stale(embedded_ts, now_ms, tf) {
+                    actions.push(format!(
+                        "kept fresh entry {} (awaiting its own cycle)",
+                        order.client_order_id
+                    ));
+                    continue;
+                }
+                // orphan entry: BUY LIMIT, unprotected, stale
                 self.sc.cancel_order(pair, &order.client_order_id).await?;
                 actions.push(format!("cancelled orphan entry {}", order.client_order_id));
+                if order.executed_qty >= filters.min_qty {
+                    // partial fill left acquired base naked — reduce it immediately (§6)
+                    let qty =
+                        crate::signed::round_qty_to_step(order.executed_qty, filters.step_size);
+                    if qty > 0.0 {
+                        let flatten_id = format!("tp-flat-{}", now_ms);
+                        self.sc.market_sell(pair, qty, &flatten_id).await?;
+                        actions.push(format!("market-sold {qty} partially-filled orphan base"));
+                    }
+                }
                 if pos
                     .as_ref()
                     .map(|p| p.entry_client_id == order.client_order_id)
@@ -320,7 +361,7 @@ impl Executor {
             if open_before > 0 {
                 lines.push(format!("{pair}: cancelled {open_before} open orders"));
             }
-            let base = base_asset(pair);
+            let base = base_asset(pair)?;
             let balances = self.sc.balances().await?;
             let free = balances
                 .iter()

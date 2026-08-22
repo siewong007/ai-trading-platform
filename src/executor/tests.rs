@@ -273,6 +273,7 @@ async fn filled_entry_places_oco_with_exact_legs() {
     let server = MockServer::start().await;
     let db = memory_db().await;
     seed_entry_pos(&db, 1_700_000_000_000).await;
+    mount_account_filters(&server).await;
     Mock::given(method("GET"))
         .and(path("/api/v3/order"))
         .respond_with(ResponseTemplate::new(200).set_body_json(open_order_json("FILLED")))
@@ -397,19 +398,20 @@ async fn reconcile_cancels_orphan_entry_without_replacing_it() {
     Mock::given(method("GET"))
         .and(path("/api/v3/openOrders"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
-            "symbol":"TESTUSDT","orderId":42,"clientOrderId":"tp-deadbee-295200000","price":"105.00000000",
+            "symbol":"TESTUSDT","orderId":42,"clientOrderId":"tp-deadbee-1700000000000","price":"105.00000000",
             "origQty":"1.00000000","executedQty":"0.00000000","status":"NEW","side":"BUY","type":"LIMIT"
         }])))
         .mount(&server)
         .await;
     let cancel_mock = Mock::given(method("DELETE"))
         .and(path("/api/v3/order"))
-        .and(query_param("origClientOrderId", "tp-deadbee-295200000"))
+        .and(query_param("origClientOrderId", "tp-deadbee-1700000000000"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "symbol":"TESTUSDT","orderId":42,"status":"CANCELED"
         })))
         .mount_as_scoped(&server)
         .await;
+    mount_account_filters(&server).await;
     // no POST /api/v3/order may happen (no re-entry during reconcile)
     Mock::given(method("POST"))
         .and(path("/api/v3/order"))
@@ -434,6 +436,7 @@ async fn reconcile_places_oco_for_filled_unprotected_entry() {
         .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
         .mount(&server)
         .await;
+    mount_account_filters(&server).await;
     Mock::given(method("GET"))
         .and(path("/api/v3/order"))
         .respond_with(ResponseTemplate::new(200).set_body_json(open_order_json("FILLED")))
@@ -554,4 +557,94 @@ async fn flatten_with_nothing_open_is_a_clean_noop() {
     let summary = ex.flatten_all().await.unwrap();
     assert!(summary.contains("no TEST balance"), "summary: {summary}");
     assert!(summary.contains("halted"));
+}
+
+#[tokio::test]
+async fn reconcile_preserves_tracked_fresh_pending_entry() {
+    let server = MockServer::start().await;
+    let db = memory_db().await;
+    seed_entry_pos(&db, 1_700_000_000_000).await; // pos tracks entry tp-deadbee-0
+                                                  // exchange still shows that NEW entry order
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+            "symbol":"TESTUSDT","orderId":42,"clientOrderId":"tp-deadbee-0","price":"105.00000000",
+            "origQty":"1.00000000","executedQty":"0.00000000","status":"NEW","side":"BUY","type":"LIMIT"
+        }])))
+        .mount(&server)
+        .await;
+    mount_account_filters(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/order"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(open_order_json("NEW")))
+        .mount(&server)
+        .await;
+    // no DELETE may occur — the entry is tracked and fresh
+    Mock::given(method("DELETE"))
+        .and(path("/api/v3/order"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("must not cancel tracked"))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let ex = exec_with(&server, db).await;
+    let summary = ex.reconcile().await.unwrap();
+    assert!(summary.contains("reconciled"), "summary: {summary}");
+}
+
+#[tokio::test]
+async fn reconcile_cancels_partial_orphan_and_sells_acquired_base() {
+    let server = MockServer::start().await;
+    let db = memory_db().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+            "symbol":"TESTUSDT","orderId":55,"clientOrderId":"tp-deadbee-1700000000000","price":"105.00000000",
+            "origQty":"2.00000000","executedQty":"0.50000000","status":"PARTIALLY_FILLED","side":"BUY","type":"LIMIT"
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v3/order"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    mount_account_filters(&server).await; // step 0.001, minQty 0.001
+    let sell_mock = Mock::given(method("POST"))
+        .and(path("/api/v3/order"))
+        .and(query_param("type", "MARKET"))
+        .and(query_param("quantity", "0.5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "symbol":"TESTUSDT","orderId":56,"clientOrderId":"tp-flat-1","status":"FILLED","executedQty":"0.50000000"
+        })))
+        .mount_as_scoped(&server)
+        .await;
+    let ex = exec_with(&server, db).await;
+    let summary = ex.reconcile().await.unwrap();
+    assert!(summary.contains("orphan"), "summary: {summary}");
+    assert!(summary.contains("market-sold 0.5"), "summary: {summary}");
+    drop(sell_mock);
+}
+
+#[tokio::test]
+async fn reconcile_keeps_fresh_untracked_entry_for_its_own_cycle() {
+    let server = MockServer::start().await;
+    let db = memory_db().await;
+    // candle time embedded = recent relative to SystemTime::now (offset small)
+    let fresh_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        - 3_600_000;
+    mount_account_filters(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+            "symbol":"TESTUSDT","orderId":60,"clientOrderId":format!("tp-fresh11-{fresh_ts}"),"price":"105.00000000",
+            "origQty":"1.00000000","executedQty":"0.00000000","status":"NEW","side":"BUY","type":"LIMIT"
+        }])))
+        .mount(&server)
+        .await;
+    let ex = exec_with(&server, db).await;
+    let summary = ex.reconcile().await.unwrap();
+    assert!(summary.contains("kept fresh entry"), "summary: {summary}");
 }
