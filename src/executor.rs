@@ -226,5 +226,134 @@ fn chrono_day(now_ms: i64) -> String {
     format!("day-{days}")
 }
 
+fn base_asset(symbol: &str) -> &str {
+    for quote in ["USDT", "FDUSD", "USDC", "BUSD", "BTC", "ETH"] {
+        if let Some(base) = symbol.strip_suffix(quote) {
+            return base;
+        }
+    }
+    symbol
+}
+
+impl Executor {
+    /// Startup reconciliation per spec §8: compare exchange state vs DB expectation.
+    /// Cancels orphan entries (our client-id prefix, BUY LIMIT, no protection attached);
+    /// recovers a FILLED-but-unprotected entry by placing its OCO; leaves live OCOs alone.
+    pub async fn reconcile(&self) -> anyhow::Result<String> {
+        let mut actions = Vec::new();
+        let pos = self.load_pos().await?;
+        for pair in &self.strat.pairs {
+            let open = self.sc.open_orders(pair).await?;
+            let mut oco_live = false;
+            for order in &open {
+                if !order.client_order_id.starts_with("tp-") {
+                    continue;
+                }
+                if order.side == "SELL" {
+                    // protective leg(s) — keep
+                    oco_live = true;
+                    continue;
+                }
+                // orphan entry: BUY LIMIT with no protection placed yet
+                self.sc.cancel_order(pair, &order.client_order_id).await?;
+                actions.push(format!("cancelled orphan entry {}", order.client_order_id));
+                if pos
+                    .as_ref()
+                    .map(|p| p.entry_client_id == order.client_order_id)
+                    .unwrap_or(false)
+                {
+                    self.clear_pos().await?;
+                    actions.push("cleared stale position state".into());
+                }
+            }
+            if oco_live && pos.is_none() {
+                actions.push(format!(
+                    "{pair}: live OCO without local state — adopting, do not re-enter"
+                ));
+            }
+            if let Some(p) = &pos {
+                if p.symbol == *pair && p.phase == ENTRY_PHASE {
+                    let status = self.sc.get_order(pair, &p.entry_client_id).await?;
+                    if status.status == "FILLED" && !oco_live {
+                        let list_id = self
+                            .sc
+                            .place_oco_sell(pair, p.qty, p.target, p.stop, &p.entry_client_id)
+                            .await?;
+                        let mut recovered = p.clone();
+                        recovered.phase = OCO_PHASE.to_string();
+                        recovered.oco_list_id = Some(list_id);
+                        self.store_pos(&recovered).await?;
+                        actions.push(format!("{pair}: FILLED entry was unprotected — OCO placed"));
+                    }
+                }
+            }
+        }
+        Ok(if actions.is_empty() {
+            "reconciled: clean".to_string()
+        } else {
+            format!("reconciled:\n - {}", actions.join("\n - "))
+        })
+    }
+
+    /// Spec §6 flatten ordering: cancel all -> CONFIRM empty -> market-reduce -> verify.
+    /// Never market-sells while an OCO can trigger.
+    pub async fn flatten_all(&self) -> anyhow::Result<String> {
+        let mut lines = Vec::new();
+        let flatten_id = format!(
+            "tp-flat-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        for pair in &self.strat.pairs {
+            let filters = self.filters(pair).await?;
+            let open_before = self.sc.open_orders(pair).await?.len();
+            if open_before > 0 {
+                self.sc.cancel_all_orders(pair).await?;
+            }
+            let still_open = self.sc.open_orders(pair).await?.len();
+            anyhow::ensure!(
+                still_open == 0,
+                "{pair}: {still_open} orders survived cancellation — refusing to sell"
+            );
+            if open_before > 0 {
+                lines.push(format!("{pair}: cancelled {open_before} open orders"));
+            }
+            let base = base_asset(pair);
+            let balances = self.sc.balances().await?;
+            let free = balances
+                .iter()
+                .find(|b| b.asset == base)
+                .map(|b| b.free)
+                .unwrap_or(0.0);
+            if free >= filters.min_qty {
+                let qty = crate::signed::round_qty_to_step(free, filters.step_size);
+                self.sc.market_sell(pair, qty, &flatten_id).await?;
+                lines.push(format!("{pair}: market-sold {qty} {base}"));
+                let after = self.sc.balances().await?;
+                let remaining = after
+                    .iter()
+                    .find(|b| b.asset == base)
+                    .map(|b| b.free)
+                    .unwrap_or(0.0);
+                anyhow::ensure!(
+                    remaining < filters.min_qty,
+                    "{pair}: {remaining} {base} remained after flatten"
+                );
+            } else {
+                lines.push(format!("{pair}: no {base} balance to reduce ({free})"));
+            }
+        }
+        let mut day = load_day_state(&self.db, &self.hash).await?;
+        day.halted = true;
+        day.halt_reason = Some("flatten requested — manual reset required".into());
+        store_day_state(&self.db, &self.hash, &day).await?;
+        self.clear_pos().await?;
+        lines.push("engine halted until manual reset".into());
+        Ok(lines.join("\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests;

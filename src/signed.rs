@@ -352,6 +352,27 @@ impl SignedClient {
         convert_open_order(raw)
     }
 
+    #[allow(dead_code)] // consumed by executor reconciliation + flatten (Task 5b)
+    pub async fn cancel_order(&self, symbol: &str, client_order_id: &str) -> anyhow::Result<()> {
+        match self
+            .signed_delete(
+                "/api/v3/order",
+                &[("symbol", symbol), ("origClientOrderId", client_order_id)],
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("-2011") || msg.to_lowercase().contains("unknown order") {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     async fn request(
         &self,
         method: reqwest::Method,

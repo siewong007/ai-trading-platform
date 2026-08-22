@@ -388,3 +388,170 @@ async fn live_oco_reports_position_live() {
         CycleOutcome::PositionLive
     );
 }
+
+#[tokio::test]
+async fn reconcile_cancels_orphan_entry_without_replacing_it() {
+    let server = MockServer::start().await;
+    let db = memory_db().await;
+    // DB thinks we are flat; exchange has an orphan BUY entry
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+            "symbol":"TESTUSDT","orderId":42,"clientOrderId":"tp-deadbee-295200000","price":"105.00000000",
+            "origQty":"1.00000000","executedQty":"0.00000000","status":"NEW","side":"BUY","type":"LIMIT"
+        }])))
+        .mount(&server)
+        .await;
+    let cancel_mock = Mock::given(method("DELETE"))
+        .and(path("/api/v3/order"))
+        .and(query_param("origClientOrderId", "tp-deadbee-295200000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "symbol":"TESTUSDT","orderId":42,"status":"CANCELED"
+        })))
+        .mount_as_scoped(&server)
+        .await;
+    // no POST /api/v3/order may happen (no re-entry during reconcile)
+    Mock::given(method("POST"))
+        .and(path("/api/v3/order"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("must not place orders"))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let ex = exec_with(&server, db).await;
+    let summary = ex.reconcile().await.unwrap();
+    assert!(summary.contains("orphan"), "summary: {summary}");
+    drop(cancel_mock);
+}
+
+#[tokio::test]
+async fn reconcile_places_oco_for_filled_unprotected_entry() {
+    let server = MockServer::start().await;
+    let db = memory_db().await;
+    seed_entry_pos(&db, 1_700_000_000_000).await;
+    // no open orders on exchange (entry filled, OCO never placed)
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/order"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(open_order_json("FILLED")))
+        .mount(&server)
+        .await;
+    let oco_mock = Mock::given(method("POST"))
+        .and(path("/api/v3/order/oco"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"orderListId": 888})),
+        )
+        .mount_as_scoped(&server)
+        .await;
+    let ex = exec_with(&server, db).await;
+    let summary = ex.reconcile().await.unwrap();
+    assert!(summary.contains("OCO placed"), "summary: {summary}");
+    drop(oco_mock);
+}
+
+#[tokio::test]
+async fn flatten_cancels_confirms_then_market_sells() {
+    let server = MockServer::start().await;
+    let db = memory_db().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+            "symbol":"TESTUSDT","orderId":7,"clientOrderId":"tp-x","price":"108.0",
+            "origQty":"1.0","executedQty":"0.0","status":"NEW","side":"SELL","type":"LIMIT_MAKER"
+        }])))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/account"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"canTrade":true,"balances":[{"asset":"USDT","free":"200.00000000","locked":"0.00000000"},{"asset":"TEST","free":"2.50000000","locked":"0.00000000"}]}"#,
+        ))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/account"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"canTrade":true,"balances":[{"asset":"USDT","free":"200.00000000","locked":"0.00000000"},{"asset":"TEST","free":"0.00000000","locked":"0.00000000"}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    // exchangeInfo for filters
+    Mock::given(method("GET"))
+        .and(path("/api/v3/exchangeInfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(EXCHANGE_INFO_JSON))
+        .mount(&server)
+        .await;
+    // TEST balance free 2.5 -> market sell expected
+    Mock::given(method("POST"))
+        .and(path("/api/v3/order"))
+        .and(query_param("type", "MARKET"))
+        .and(query_param("side", "SELL"))
+        .and(query_param("quantity", "2.5"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "symbol":"TESTUSDT","orderId":9,"clientOrderId":"tp-flat-1","status":"FILLED","executedQty":"2.50000000"
+        })))
+        .mount(&server)
+        .await;
+    let ex = exec_with(&server, db).await;
+    let summary = match ex.flatten_all().await {
+        Ok(s) => s,
+        Err(e) => {
+            let reqs = server.received_requests().await.unwrap();
+            let paths: Vec<String> = reqs
+                .iter()
+                .map(|r| format!("{} {}", r.method, r.url))
+                .collect();
+            panic!("flatten failed: {e} — requests={paths:?}");
+        }
+    };
+    assert!(
+        summary.contains("market-sold 2.5 TEST"),
+        "summary: {summary}"
+    );
+    // ORDERING: cancel-all DELETE must precede the market SELL POST
+    let reqs = server.received_requests().await.unwrap();
+    let del_idx = reqs
+        .iter()
+        .position(|r| r.method == "DELETE" && r.url.path() == "/api/v3/openOrders")
+        .expect("cancel-all happened");
+    let sell_idx = reqs
+        .iter()
+        .position(|r| {
+            r.method == "POST"
+                && r.url.path() == "/api/v3/order"
+                && r.url.query().unwrap_or("").contains("type=MARKET")
+        })
+        .expect("market sell happened");
+    assert!(del_idx < sell_idx, "cancel must precede market sell");
+}
+
+#[tokio::test]
+async fn flatten_with_nothing_open_is_a_clean_noop() {
+    let server = MockServer::start().await;
+    let db = memory_db().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&server)
+        .await;
+    mount_account_filters(&server).await;
+    let ex = exec_with(&server, db).await;
+    let summary = ex.flatten_all().await.unwrap();
+    assert!(summary.contains("no TEST balance"), "summary: {summary}");
+    assert!(summary.contains("halted"));
+}
