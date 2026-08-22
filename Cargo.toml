@@ -25,6 +25,8 @@ hex = "0.4"
 wiremock = "0.6"
 
 [profile.release]
-# NOTE: no LTO — thin-LTO breaks dlopen of proc-macro dylibs built on this
-# exFAT external volume ("mis-aligned LINKEDIT string pool").
+# NOTE: no LTO. This machine's OS-beta toolchain emits release proc-macro dylibs
+# dyld rejects ("mis-aligned LINKEDIT string pool"); release binaries are built
+# in CI (.github/workflows/release.yml), not locally.
 opt-level = 3
+
