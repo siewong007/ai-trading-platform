@@ -2,6 +2,9 @@
 name = "trading_platform"
 version = "0.2.1"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/siewong007/ai-trading-platform"
+description = "Personal Binance spot trading lab: EMA/RSI with ATR stops and a pre-registered backtest gate"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
