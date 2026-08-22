@@ -48,6 +48,9 @@ enum Command {
     Search {
         #[arg(long, default_value = "config/strategy_ema_rsi.toml")]
         config: String,
+        /// Allow new config hashes this run (requires typing NEW-OOS)
+        #[arg(long)]
+        unlock_new_study: bool,
     },
     /// Export trades table to CSV (tax records)
     Export {
@@ -96,7 +99,10 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Fetch { config } => rt.block_on(run_fetch(&config))?,
         Command::Backtest { config } => rt.block_on(run_backtest(&config))?,
-        Command::Search { config } => rt.block_on(run_search(&config))?,
+        Command::Search {
+            config,
+            unlock_new_study,
+        } => rt.block_on(run_search(&config, unlock_new_study))?,
         Command::Export { out } => rt.block_on(run_export(&out))?,
         Command::Trade {
             config,
@@ -432,10 +438,37 @@ async fn run_backtest(config_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn confirm_new_study_input(input: &str) -> bool {
+    input.trim() == "NEW-OOS"
+}
+
+fn confirm_new_study() -> anyhow::Result<()> {
+    println!("Unlocking reserved variant slots. Type NEW-OOS to continue:");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    anyhow::ensure!(
+        confirm_new_study_input(&line),
+        "aborted: new configs require the literal phrase NEW-OOS on stdin"
+    );
+    Ok(())
+}
+
 /// Pre-registered rule (spec §5): at most GATE_MAX_VARIANTS DISTINCT configs
 /// may EVER run. Re-running an already-known hash is free; a NEW hash that
 /// would push the distinct total past the cap is refused BEFORE any work.
-fn check_variant_budget(used_distinct: u32, is_new_hash: bool) -> anyhow::Result<()> {
+/// New hashes also require `--unlock-new-study` + NEW-OOS for this run.
+fn check_variant_budget(
+    used_distinct: u32,
+    is_new_hash: bool,
+    new_study_unlocked: bool,
+) -> anyhow::Result<()> {
+    if is_new_hash && !new_study_unlocked {
+        anyhow::bail!(
+            "refusing new config: remaining variant slots are reserved for a documented new OOS study. \
+             Re-run a known hash, or pass --unlock-new-study and type NEW-OOS. \
+             ({used_distinct}/{GATE_MAX_VARIANTS} distinct configs used)"
+        );
+    }
     if is_new_hash && used_distinct >= GATE_MAX_VARIANTS {
         anyhow::bail!(
             "refusing new config #{}: variant budget exhausted \
@@ -448,7 +481,7 @@ fn check_variant_budget(used_distinct: u32, is_new_hash: bool) -> anyhow::Result
     Ok(())
 }
 
-async fn run_search(config_path: &str) -> anyhow::Result<()> {
+async fn run_search(config_path: &str, unlock_new_study: bool) -> anyhow::Result<()> {
     let base = StrategyConfig::load(config_path)?;
     let db = Db::open_default().await?;
 
@@ -472,6 +505,10 @@ async fn run_search(config_path: &str) -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let mut used = counter.max(db.distinct_config_count().await?);
+
+    if unlock_new_study {
+        confirm_new_study()?;
+    }
 
     #[allow(dead_code)] // reported fields kept for ranked output
     struct Row {
@@ -498,7 +535,7 @@ async fn run_search(config_path: &str) -> anyhow::Result<()> {
         .config_hash();
 
         // refuse NEW distinct hashes past the cap; re-running a known one is free
-        check_variant_budget(used, !known.contains(&hash))?;
+        check_variant_budget(used, !known.contains(&hash), unlock_new_study)?;
 
         let results = evaluate_config(&db, &strat, &base.backtest, Some(&hash)).await?;
         if known.insert(hash) {
@@ -614,14 +651,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn variant_budget_refuses_21st_distinct_hash_but_reruns_are_free() {
-        assert!(check_variant_budget(GATE_MAX_VARIANTS - 1, true).is_ok());
-        // re-running an already-known hash is free, even at the cap
-        assert!(check_variant_budget(GATE_MAX_VARIANTS, false).is_ok());
-        assert!(check_variant_budget(u32::MAX, false).is_ok());
-        // the 21st DISTINCT hash is refused before any work happens
-        let err = check_variant_budget(GATE_MAX_VARIANTS, true).unwrap_err();
+    fn variant_budget_lock_refuses_new_hash_without_unlock() {
+        let err = check_variant_budget(12, true, false).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("reserved"), "{msg}");
+        assert!(msg.contains("--unlock-new-study"), "{msg}");
+        assert!(msg.contains("NEW-OOS"), "{msg}");
+    }
+
+    #[test]
+    fn variant_budget_lock_allows_known_hash_without_unlock() {
+        assert!(check_variant_budget(12, false, false).is_ok());
+        assert!(check_variant_budget(GATE_MAX_VARIANTS, false, false).is_ok());
+        assert!(check_variant_budget(u32::MAX, false, false).is_ok());
+    }
+
+    #[test]
+    fn variant_budget_unlock_allows_new_hash_under_cap() {
+        assert!(check_variant_budget(GATE_MAX_VARIANTS - 1, true, true).is_ok());
+    }
+
+    #[test]
+    fn variant_budget_unlock_still_refuses_21st_distinct_hash() {
+        let err = check_variant_budget(GATE_MAX_VARIANTS, true, true).unwrap_err();
         assert!(err.to_string().contains("budget"), "{err}");
+    }
+
+    #[test]
+    fn new_study_unlock_requires_the_literal_phrase() {
+        assert!(!confirm_new_study_input("new-oos\n"));
+        assert!(!confirm_new_study_input("GO\n"));
+        assert!(!confirm_new_study_input(""));
+        assert!(!confirm_new_study_input("NEW-OOS extra\n"));
+        assert!(confirm_new_study_input("NEW-OOS\n"));
+        assert!(confirm_new_study_input("NEW-OOS"));
+    }
+
+    #[test]
+    fn search_subcommand_parses_unlock_flag() {
+        let cli = Cli::try_parse_from(["tp", "search", "--config", "c.toml"]).unwrap();
+        match cli.command {
+            Command::Search {
+                config,
+                unlock_new_study,
+            } => {
+                assert_eq!(config, "c.toml");
+                assert!(!unlock_new_study);
+            }
+            _ => panic!("expected Search"),
+        }
+        let cli = Cli::try_parse_from(["tp", "search", "--unlock-new-study"]).unwrap();
+        match cli.command {
+            Command::Search {
+                unlock_new_study, ..
+            } => assert!(unlock_new_study),
+            _ => panic!("expected Search"),
+        }
+        assert!(
+            Cli::try_parse_from(["tp", "trade", "--unlock-new-study"]).is_err(),
+            "unlock flag is search-only"
+        );
     }
 
     #[test]
