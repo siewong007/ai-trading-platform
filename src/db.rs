@@ -169,6 +169,15 @@ impl Db {
         Self::config_set_in(&mut conn, key, value).await
     }
 
+    pub async fn config_del(&self, key: &str) -> anyhow::Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("DELETE FROM config_state WHERE key = ?")
+            .bind(key)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
     async fn config_get_in(
         conn: &mut sqlx::SqliteConnection,
         key: &str,

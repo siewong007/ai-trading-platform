@@ -1,6 +1,7 @@
 mod backtest;
 mod db;
 mod exchange;
+mod executor;
 mod indicators;
 mod metrics;
 mod risk;

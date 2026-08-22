@@ -13,6 +13,7 @@ pub struct Keys {
 }
 
 impl Keys {
+    #[allow(dead_code)] // wired into the trade CLI in Task 6
     pub fn from_env() -> anyhow::Result<Keys> {
         let api_key = std::env::var("BINANCE_API_KEY")
             .map_err(|_| anyhow::anyhow!("missing env var BINANCE_API_KEY"))?;
@@ -83,7 +84,7 @@ pub fn round_qty_to_step(qty: f64, step_size: f64) -> f64 {
     ((qty / step_size).floor() * step_size * 1e8).round() / 1e8
 }
 
-fn fmt_price(x: f64) -> String {
+pub(crate) fn fmt_price(x: f64) -> String {
     let mut s = format!("{x:.8}");
     while s.ends_with('0') {
         s.pop();
@@ -101,6 +102,11 @@ pub struct SignedClient {
 }
 
 impl SignedClient {
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
+    #[allow(dead_code)] // production construction site lands with the trade CLI (Task 6)
     pub fn new(base: &str, keys: Keys) -> anyhow::Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder()
@@ -331,7 +337,11 @@ impl SignedClient {
     }
 
     #[allow(dead_code)] // Phase 2 (executor) consumes this
-    pub async fn get_order(&self, symbol: &str, client_order_id: &str) -> anyhow::Result<OpenOrder> {
+    pub async fn get_order(
+        &self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> anyhow::Result<OpenOrder> {
         let body = self
             .signed_get(
                 "/api/v3/order",
@@ -879,9 +889,11 @@ mod tests {
             .unwrap();
 
         let binance_empty = MockServer::start().await;
-        Mock::given(method("DELETE")).respond_with(ResponseTemplate::new(400).set_body_string(
-            r#"{"code":-2011,"msg":"Order list is empty."}"#,
-        ))
+        Mock::given(method("DELETE"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"code":-2011,"msg":"Order list is empty."}"#),
+            )
             .mount(&binance_empty)
             .await;
         signed_client(&binance_empty.uri())
@@ -890,8 +902,11 @@ mod tests {
             .unwrap();
 
         let other_err = MockServer::start().await;
-        Mock::given(method("DELETE")).respond_with(ResponseTemplate::new(500)
-            .set_body_string(r#"{"code":-1000,"msg":"Internal error."}"#))
+        Mock::given(method("DELETE"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(r#"{"code":-1000,"msg":"Internal error."}"#),
+            )
             .mount(&other_err)
             .await;
         let err = signed_client(&other_err.uri())
