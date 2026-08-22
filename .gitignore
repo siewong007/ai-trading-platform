@@ -4,3 +4,4 @@
 *.db-wal
 .env
 data/
+.cargo/config.toml
