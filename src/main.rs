@@ -11,12 +11,12 @@ mod types;
 
 use backtest::{run, BacktestOutput};
 use clap::{Parser, Subcommand};
-use db::{BacktestRunRow, Db};
+use db::{BacktestRunRow, Db, TradeRow};
 use exchange::Exchange;
+use executor::{CycleOutcome, Executor};
 use metrics::{
     evaluate_gate, max_drawdown_pct, GateVerdict, Metrics, PairReport, GATE_MAX_VARIANTS,
 };
-use executor::{CycleOutcome, Executor};
 use signed::{Keys, SignedClient};
 use strategy::{BacktestSection, StrategyConfig, StrategySection};
 use types::Candle;
@@ -130,8 +130,10 @@ fn gate_banner(latest_pass: Option<bool>) -> String {
         Some(false) => "latest stored search OVERALL verdict: FAIL\n\
                         PRE-REGISTERED GATE VERDICT: NO-GO — running against spec §5 advice"
             .to_string(),
-        Some(true) => "latest stored search OVERALL verdict: GO (pre-registered gate PASS on record)"
-            .to_string(),
+        Some(true) => {
+            "latest stored search OVERALL verdict: GO (pre-registered gate PASS on record)"
+                .to_string()
+        }
     }
 }
 
@@ -176,9 +178,7 @@ async fn telegram_send(text: &str) -> anyhow::Result<()> {
 }
 
 async fn notify(text: &str) {
-    if std::env::var("TELEGRAM_BOT_TOKEN").is_err()
-        || std::env::var("TELEGRAM_CHAT_ID").is_err()
-    {
+    if std::env::var("TELEGRAM_BOT_TOKEN").is_err() || std::env::var("TELEGRAM_CHAT_ID").is_err() {
         return;
     }
     if let Err(e) = telegram_send(text).await {
@@ -553,8 +553,41 @@ async fn run_search(config_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_export(_out: &str) -> anyhow::Result<()> {
-    anyhow::bail!("export arrives with live trading (Phase 2): no fills exist yet")
+fn trades_csv(trades: &[TradeRow]) -> String {
+    let mut s = String::from(
+        "id,client_order_id,symbol,side,qty,entry_price,entry_ts,exit_price,exit_ts,\
+         fee_paid,pnl,pnl_pct,strategy,mode\n",
+    );
+    for t in trades {
+        let f = |v: Option<f64>| v.map(|x| x.to_string()).unwrap_or_default();
+        let i = |v: Option<i64>| v.map(|x| x.to_string()).unwrap_or_default();
+        s.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            t.id,
+            t.client_order_id.as_deref().unwrap_or(""),
+            t.symbol,
+            t.side,
+            t.qty,
+            t.entry_price,
+            t.entry_ts,
+            f(t.exit_price),
+            i(t.exit_ts),
+            t.fee_paid,
+            f(t.pnl),
+            f(t.pnl_pct),
+            t.strategy,
+            t.mode,
+        ));
+    }
+    s
+}
+
+async fn run_export(out: &str) -> anyhow::Result<()> {
+    let db = Db::open_default().await?;
+    let trades = db.load_trades().await?;
+    std::fs::write(out, trades_csv(&trades))?;
+    tracing::info!("exported {} trades to {out}", trades.len());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -602,9 +635,7 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Command::Trade {
-                testnet, live, ..
-            } => {
+            Command::Trade { testnet, live, .. } => {
                 assert!(!testnet);
                 assert!(live);
             }
@@ -639,6 +670,62 @@ mod tests {
         assert!(fail.contains("NO-GO"), "{fail}");
         assert!(fail.contains("PRE-REGISTERED GATE VERDICT"));
         assert!(!gate_banner(Some(true)).contains("NO-GO"));
+    }
+
+    #[test]
+    fn trades_csv_writes_header_and_blank_exit_cells_for_open_trade() {
+        use db::TradeRow;
+        let closed_then_open = vec![
+            TradeRow {
+                id: 1,
+                client_order_id: Some("tp-x-9".into()),
+                symbol: "BTCUSDT".into(),
+                side: "SELL".into(),
+                qty: 0.01,
+                entry_price: 40_000.0,
+                entry_ts: 1_700_000_000_000,
+                exit_price: Some(41_000.0),
+                exit_ts: Some(1_700_003_600_000),
+                fee_paid: 0.08,
+                pnl: Some(1.0),
+                pnl_pct: Some(0.25),
+                strategy: "ema_rsi".into(),
+                mode: "live".into(),
+            },
+            TradeRow {
+                id: 2,
+                client_order_id: None,
+                symbol: "ETHUSDT".into(),
+                side: "BUY".into(),
+                qty: 0.5,
+                entry_price: 2_000.0,
+                entry_ts: 1_700_000_100_000,
+                exit_price: None,
+                exit_ts: None,
+                fee_paid: 0.02,
+                pnl: None,
+                pnl_pct: None,
+                strategy: "ema_rsi".into(),
+                mode: "live".into(),
+            },
+        ];
+        let csv = trades_csv(&closed_then_open);
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next(),
+            Some(
+                "id,client_order_id,symbol,side,qty,entry_price,entry_ts,exit_price,exit_ts,fee_paid,pnl,pnl_pct,strategy,mode"
+            )
+        );
+        assert_eq!(
+            lines.next(),
+            Some("1,tp-x-9,BTCUSDT,SELL,0.01,40000,1700000000000,41000,1700003600000,0.08,1,0.25,ema_rsi,live")
+        );
+        assert_eq!(
+            lines.next(),
+            Some("2,,ETHUSDT,BUY,0.5,2000,1700000100000,,,0.02,,,ema_rsi,live")
+        );
+        assert_eq!(lines.next(), None);
     }
 
     #[test]

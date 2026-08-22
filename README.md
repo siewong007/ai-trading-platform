@@ -1,0 +1,38 @@
+# trading_platform
+
+Personal AI-free algorithmic spot-trading platform for Binance (EMA/RSI
+strategy with ATR stops), built around an honest pre-registered backtest gate.
+
+**Current gate verdict: NO-GO — do not run against real funds** (spec §5).
+Testnet-first by design: `trade` defaults to `https://testnet.binance.vision`;
+live requires `--live` plus typing the literal word `GO`.
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `fetch` | cache ~18 months of 1h klines per configured pair |
+| `backtest` | one config: IS/OOS report + gate verdict |
+| `search` | pre-declared variant grid within the 20-config lifetime budget |
+| `export --out FILE.csv` | trades table → CSV (tax records) |
+| `trade [--once] [--dry-run] [--testnet\|--live]` | executor loop (testnet default) |
+| `flatten` | kill switch: cancel all → confirm → market-reduce → verify |
+
+## Quickstart
+
+```sh
+cp .env.example .env      # add keys (spot-only, withdrawals OFF, IP-whitelisted)
+cargo build --release
+scripts/smoke_local.sh    # build + tests + keyless-refusal + export checks
+cargo run --release -- fetch
+cargo run --release -- search
+cargo run --release -- trade --once --dry-run   # single testnet cycle
+```
+
+Risk rails (fixed-dollar mode): $2/trade risk, max 1 position, ≤50% equity
+notional cap, skip <$15 notional, daily halt at −2% or 2 consecutive
+stop-outs, −3% day → flatten-all + halt until manual reset, stale-data
+refusal, exchange lot/notional compliance enforced pre-submit.
+
+Secrets live only in `.env` (gitignored); keys are never logged or stored in
+the DB. Operations manual: [docs/RUNBOOK.md](docs/RUNBOOK.md).

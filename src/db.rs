@@ -240,16 +240,19 @@ impl Db {
             if !by_hash.contains_key(&hash) {
                 order.push(hash.clone());
             }
-            by_hash.entry(hash).or_default().push(crate::metrics::PairReport {
-                symbol: r.get("symbol"),
-                metrics: crate::metrics::Metrics {
-                    total_trades: r.get::<i64, _>("oos_trades").max(0) as usize,
-                    profit_factor: r.get("oos_pf"),
-                    win_rate: 0.0,
-                    net_pnl: r.get("oos_pnl"),
-                    max_drawdown_pct: r.get("oos_dd"),
-                },
-            });
+            by_hash
+                .entry(hash)
+                .or_default()
+                .push(crate::metrics::PairReport {
+                    symbol: r.get("symbol"),
+                    metrics: crate::metrics::Metrics {
+                        total_trades: r.get::<i64, _>("oos_trades").max(0) as usize,
+                        profit_factor: r.get("oos_pf"),
+                        win_rate: 0.0,
+                        net_pnl: r.get("oos_pnl"),
+                        max_drawdown_pct: r.get("oos_dd"),
+                    },
+                });
         }
         Ok(order
             .first()
@@ -258,8 +261,7 @@ impl Db {
 }
 
 /// One OOS result row recorded for a backtested config on one symbol.
-#[derive(Clone)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BacktestRunRow {
     pub symbol: String,
     pub rsi_entry: f64,
@@ -322,6 +324,53 @@ impl Db {
         }
         tx.commit().await?;
         Ok(())
+    }
+}
+
+/// One executed trade as stored in the trades table (backtest or live fill).
+#[derive(Clone, Debug)]
+pub struct TradeRow {
+    pub id: i64,
+    pub client_order_id: Option<String>,
+    pub symbol: String,
+    pub side: String,
+    pub qty: f64,
+    pub entry_price: f64,
+    pub entry_ts: i64,
+    pub exit_price: Option<f64>,
+    pub exit_ts: Option<i64>,
+    pub fee_paid: f64,
+    pub pnl: Option<f64>,
+    pub pnl_pct: Option<f64>,
+    pub strategy: String,
+    pub mode: String,
+}
+
+impl Db {
+    /// All trades in insertion order — consumed by the `export` CSV writer.
+    pub async fn load_trades(&self) -> anyhow::Result<Vec<TradeRow>> {
+        let rows = sqlx::query("SELECT * FROM trades ORDER BY id ASC")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| TradeRow {
+                id: r.get("id"),
+                client_order_id: r.get("client_order_id"),
+                symbol: r.get("symbol"),
+                side: r.get("side"),
+                qty: r.get("qty"),
+                entry_price: r.get("entry_price"),
+                entry_ts: r.get("entry_ts"),
+                exit_price: r.get("exit_price"),
+                exit_ts: r.get("exit_ts"),
+                fee_paid: r.get("fee_paid"),
+                pnl: r.get("pnl"),
+                pnl_pct: r.get("pnl_pct"),
+                strategy: r.get("strategy"),
+                mode: r.get("mode"),
+            })
+            .collect())
     }
 }
 
@@ -487,5 +536,38 @@ mod tests {
             .await,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn load_trades_returns_rows_in_insertion_order_with_optional_fields() {
+        let db = mem_db().await;
+        assert!(db.load_trades().await.unwrap().is_empty());
+        sqlx::query(
+            "INSERT INTO trades(client_order_id,symbol,side,qty,entry_price,entry_ts,
+             exit_price,exit_ts,fee_paid,pnl,pnl_pct,strategy,mode)
+             VALUES('tp-a','BTCUSDT','SELL',0.01,40000.0,1700000000000,
+             41000.0,1700003600000,0.08,1.0,0.25,'ema_rsi','backtest')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO trades(symbol,side,qty,entry_price,entry_ts,fee_paid,strategy,mode)
+             VALUES('ETHUSDT','BUY',0.5,2000.0,1700000100000,0.02,'ema_rsi','live')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let ts = db.load_trades().await.unwrap();
+        assert_eq!(ts.len(), 2);
+        assert_eq!(ts[0].id, 1);
+        assert_eq!(ts[0].client_order_id.as_deref(), Some("tp-a"));
+        assert_eq!(ts[0].exit_ts, Some(1_700_003_600_000));
+        assert!((ts[0].pnl.unwrap() - 1.0).abs() < 1e-9);
+        assert!((ts[0].pnl_pct.unwrap() - 0.25).abs() < 1e-9);
+        assert_eq!(ts[1].id, 2);
+        assert_eq!(ts[1].client_order_id, None);
+        assert_eq!(ts[1].exit_price, None);
+        assert_eq!(ts[1].pnl, None);
     }
 }
