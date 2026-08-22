@@ -464,7 +464,7 @@ mod tests {
         }
     }
 
-    async fn scalar(db: &Db, sql: &str) -> i64 {
+    async fn scalar(db: &Db, sql: &'static str) -> i64 {
         sqlx::query(sql)
             .fetch_one(&db.pool)
             .await
