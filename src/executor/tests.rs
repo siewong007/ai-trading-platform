@@ -648,3 +648,72 @@ async fn reconcile_keeps_fresh_untracked_entry_for_its_own_cycle() {
     let summary = ex.reconcile().await.unwrap();
     assert!(summary.contains("kept fresh entry"), "summary: {summary}");
 }
+
+#[tokio::test]
+async fn dry_run_never_places_recovery_oco() {
+    let server = MockServer::start().await;
+    let db = memory_db().await;
+    seed_pos_phase(&db, OCO_PHASE, 1_700_000_000_000).await;
+    // no tp-* orders (OCO vanished), no exits yet
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/myTrades"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&server)
+        .await;
+    mount_account_filters(&server).await;
+    // any POST /order/oco would be a real order — forbid it
+    Mock::given(method("POST"))
+        .and(path("/api/v3/order/oco"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("dry-run must not place"))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut ex = exec_with(&server, db).await;
+    ex.dry_run = true;
+    assert_eq!(
+        ex.run_cycle(1_700_003_600_000).await.unwrap(),
+        CycleOutcome::PositionLive
+    );
+}
+
+#[tokio::test]
+async fn protection_missing_re_arms_oco_for_remaining_size() {
+    let server = MockServer::start().await;
+    let db = memory_db().await;
+    seed_pos_phase(&db, OCO_PHASE, 1_700_000_000_000).await;
+    // pos qty is 1.0; exchange shows NO tp-* orders; myTrades shows a partial
+    // manual exit of 0.4 -> remaining 0.6 must get a fresh protective OCO
+    Mock::given(method("GET"))
+        .and(path("/api/v3/openOrders"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v3/myTrades"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"id":1,"orderId":42,"price":"105.0","qty":"0.6","commission":"0.06","time":1700000100000u64},
+            {"id":2,"orderId":77,"price":"104.0","qty":"0.4","commission":"0.04","time":1700001000000u64}
+        ])))
+        .mount(&server)
+        .await;
+    mount_account_filters(&server).await;
+    let oco_mock = Mock::given(method("POST"))
+        .and(path("/api/v3/order/oco"))
+        .and(query_param("quantity", "0.6"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"orderListId": 999})),
+        )
+        .mount_as_scoped(&server)
+        .await;
+    let ex = exec_with(&server, db).await;
+    match ex.run_cycle(1_700_003_600_000).await.unwrap() {
+        CycleOutcome::PlacedOco { list_id } => assert_eq!(list_id, "999"),
+        other => panic!("expected re-arm PlacedOco, got {other:?}"),
+    }
+    drop(oco_mock);
+}

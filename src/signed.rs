@@ -1,6 +1,7 @@
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
+use std::sync::atomic::Ordering;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -81,10 +82,16 @@ pub struct PlacedOrder {
 }
 
 pub fn round_qty_to_step(qty: f64, step_size: f64) -> f64 {
+    if step_size <= 0.0 || !qty.is_finite() || qty <= 0.0 {
+        return 0.0;
+    }
     ((qty / step_size).floor() * step_size * 1e8).round() / 1e8
 }
 
 pub(crate) fn fmt_price(x: f64) -> String {
+    if !x.is_finite() {
+        return "0".to_string();
+    }
     let mut s = format!("{x:.8}");
     while s.ends_with('0') {
         s.pop();
@@ -99,6 +106,7 @@ pub struct SignedClient {
     http: reqwest::Client,
     base: String,
     keys: Keys,
+    time_skew_ms: std::sync::atomic::AtomicI64,
 }
 
 impl SignedClient {
@@ -114,6 +122,7 @@ impl SignedClient {
                 .build()?,
             base: base.trim_end_matches('/').to_string(),
             keys,
+            time_skew_ms: std::sync::atomic::AtomicI64::new(0),
         })
     }
 
@@ -379,11 +388,45 @@ impl SignedClient {
         path: &str,
         params: &[(&str, &str)],
     ) -> anyhow::Result<String> {
+        match self.request_once(method.clone(), path, params).await {
+            Err(e) if e.to_string().starts_with("binance error -1021") => {
+                // clock skew: resync against server time and retry once
+                let now = self.server_time_ms().await.unwrap_or_default();
+                self.time_skew_ms.store(
+                    now - chrono::Utc::now().timestamp_millis(),
+                    Ordering::Relaxed,
+                );
+                self.request_once(method, path, params).await
+            }
+            other => other,
+        }
+    }
+
+    async fn server_time_ms(&self) -> anyhow::Result<i64> {
+        #[derive(serde::Deserialize)]
+        #[allow(non_snake_case)]
+        struct T {
+            serverTime: i64,
+        }
+        let body = self
+            .http
+            .get(format!("{}/api/v3/time", self.base))
+            .send()
+            .await?
+            .text()
+            .await?;
+        Ok(serde_json::from_str::<T>(&body)?.serverTime)
+    }
+
+    async fn request_once(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        params: &[(&str, &str)],
+    ) -> anyhow::Result<String> {
         let mut parts: Vec<String> = params.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        parts.push(format!(
-            "timestamp={}",
-            chrono::Utc::now().timestamp_millis()
-        ));
+        let ts = chrono::Utc::now().timestamp_millis() + self.time_skew_ms.load(Ordering::Relaxed);
+        parts.push(format!("timestamp={ts}"));
         parts.push(format!("recvWindow={RECV_WINDOW}"));
         let query = parts.join("&");
         let signature = sign_query(&self.keys.secret, &query);
@@ -393,7 +436,8 @@ impl SignedClient {
             .request(method, &url)
             .header("X-MBX-APIKEY", &self.keys.api_key)
             .send()
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!("transport error calling {path}: {}", e.without_url()))?;
         let status = resp.status();
         let body = resp.text().await?;
         if !status.is_success() {

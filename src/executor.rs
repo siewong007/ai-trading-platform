@@ -2,7 +2,7 @@
 
 use crate::db::Db;
 use crate::risk::{load_day_state, register_result, risk_pass, roll_day_if_new, store_day_state};
-use crate::signed::{PlacedOrder, SignedClient, SymbolFilters};
+use crate::signed::{SignedClient, SymbolFilters};
 use crate::strategy::{generate_signals, BacktestSection, StrategySection};
 use crate::types::Candle;
 use serde::{Deserialize, Serialize};
@@ -91,11 +91,13 @@ impl Executor {
         self.db.config_del(&pos_key(&self.hash)).await
     }
 
-    fn free_usdt(balances: &[crate::signed::Balance]) -> f64 {
+    fn usdt_equity(balances: &[crate::signed::Balance]) -> f64 {
+        // free + locked: locked USDT is capital committed to open orders, and
+        // using free alone would let deposits/locks mask the day-loss halts
         balances
             .iter()
             .find(|b| b.asset == "USDT")
-            .map(|b| b.free)
+            .map(|b| b.free + b.locked)
             .unwrap_or(0.0)
     }
 
@@ -122,7 +124,7 @@ impl Executor {
                 continue;
             };
             let balances = self.sc.balances().await?;
-            let equity = Self::free_usdt(&balances);
+            let equity = Self::usdt_equity(&balances);
             let mut day = load_day_state(&self.db, &self.hash).await?;
             let equity_ref = equity.max(day.day_start_equity);
             roll_day_if_new(&mut day, &chrono_day(now_ms), equity_ref);
@@ -134,10 +136,8 @@ impl Executor {
                         tracing::info!("DRY-RUN intent: buy {qty} {pair} @ {entry_limit} id={cid}");
                         return Ok(CycleOutcome::PlacedEntry { client_id: cid });
                     }
-                    let placed: PlacedOrder = self
-                        .sc
-                        .place_limit_buy(pair, qty, entry_limit, &cid)
-                        .await?;
+                    // write-ahead: persist intent BEFORE hitting the exchange so a
+                    // crash mid-placement leaves a tracked (reconcilable) order
                     self.store_pos(&PosState {
                         phase: ENTRY_PHASE.to_string(),
                         symbol: pair.clone(),
@@ -147,10 +147,22 @@ impl Executor {
                         stop: plan.stop,
                         target: plan.target,
                         opened_ts: now_ms,
-                        entry_order_id: Some(placed.order_id),
+                        entry_order_id: None,
                         oco_list_id: None,
                     })
                     .await?;
+                    match self.sc.place_limit_buy(pair, qty, entry_limit, &cid).await {
+                        Ok(placed) => {
+                            let mut p = self.load_pos().await?.unwrap();
+                            p.entry_order_id = Some(placed.order_id);
+                            self.store_pos(&p).await?;
+                        }
+                        Err(e) => {
+                            tracing::error!("{pair}: entry placement failed: {e}");
+                            self.clear_pos().await?;
+                            return Err(e);
+                        }
+                    }
                     return Ok(CycleOutcome::PlacedEntry { client_id: cid });
                 }
                 crate::risk::RiskDecision::Skip(reason) => {
@@ -162,6 +174,11 @@ impl Executor {
                     day.halt_reason = Some(reason.clone());
                     store_day_state(&self.db, &self.hash, &day).await?;
                     tracing::warn!("HALT: {reason} — no entries until manual reset");
+                    if reason == crate::risk::FLATTEN_REASON {
+                        // spec §4: -3% day => flatten all, halt until manual reset
+                        let summary = self.flatten_all().await?;
+                        tracing::warn!("auto-flatten executed:\n{summary}");
+                    }
                     return Ok(CycleOutcome::Flat);
                 }
             }
@@ -175,6 +192,17 @@ impl Executor {
             ENTRY_PHASE => {
                 let order = self.sc.get_order(&pair, &pos.entry_client_id).await?;
                 if order.status == "FILLED" {
+                    if self.dry_run {
+                        tracing::info!(
+                            "DRY-RUN intent: OCO sell {} {pair} tp={} stop={}",
+                            pos.qty,
+                            pos.target,
+                            pos.stop
+                        );
+                        return Ok(CycleOutcome::PlacedOco {
+                            list_id: "dry-run".into(),
+                        });
+                    }
                     let list_id = self
                         .sc
                         .place_oco_sell(&pair, pos.qty, pos.target, pos.stop, &pos.entry_client_id)
@@ -201,8 +229,36 @@ impl Executor {
                     .collect();
                 let exit_qty: f64 = exits.iter().map(|t| t.qty).sum();
                 if exit_qty + 1e-9 < pos.qty {
-                    tracing::warn!("{pair}: position state unclear (exit_qty {exit_qty})");
-                    return Ok(CycleOutcome::PositionLive);
+                    // OCO vanished without filling us fully: protection is gone.
+                    // Re-arm the OCO over the REMAINING size (spec §6 safety-first).
+                    let remaining = round_remaining(pos.qty - exit_qty);
+                    let filters = self.filters(&pair).await?;
+                    if remaining >= filters.min_qty {
+                        tracing::warn!(
+                            "{pair}: protection missing with {remaining} open — re-arming OCO"
+                        );
+                        if self.dry_run {
+                            tracing::info!("DRY-RUN intent: re-arm OCO {remaining} {pair}");
+                            return Ok(CycleOutcome::PositionLive);
+                        }
+                        let list_id = self
+                            .sc
+                            .place_oco_sell(
+                                &pair,
+                                remaining,
+                                pos.target,
+                                pos.stop,
+                                &pos.entry_client_id,
+                            )
+                            .await?;
+                        let mut p = pos.clone();
+                        p.qty = remaining;
+                        p.oco_list_id = Some(list_id.clone());
+                        self.store_pos(&p).await?;
+                        return Ok(CycleOutcome::PlacedOco { list_id });
+                    }
+                    // dust remainder: treat position as closed on realized exits
+                    tracing::warn!("{pair}: only dust left ({remaining}) — closing state");
                 }
                 let exit_notional: f64 = exits.iter().map(|t| t.price * t.qty).sum();
                 let fees: f64 = exits.iter().map(|t| t.commission).sum();
@@ -224,6 +280,11 @@ fn chrono_day(now_ms: i64) -> String {
     let secs = now_ms / 1000;
     let days = secs.div_euclid(86_400);
     format!("day-{days}")
+}
+
+fn round_remaining(qty: f64) -> f64 {
+    // 8-decimal floor keeps the re-arm size tradeable and <= actual holding
+    (qty * 1e8).floor() / 1e8
 }
 
 fn base_asset(symbol: &str) -> anyhow::Result<&str> {
@@ -286,12 +347,37 @@ impl Executor {
                     continue;
                 }
                 // orphan entry: BUY LIMIT, unprotected, stale
-                self.sc.cancel_order(pair, &order.client_order_id).await?;
-                actions.push(format!("cancelled orphan entry {}", order.client_order_id));
-                if order.executed_qty >= filters.min_qty {
-                    // partial fill left acquired base naked — reduce it immediately (§6)
-                    let qty =
-                        crate::signed::round_qty_to_step(order.executed_qty, filters.step_size);
+                if self.dry_run {
+                    actions.push(format!(
+                        "DRY-RUN would cancel orphan {}",
+                        order.client_order_id
+                    ));
+                    continue;
+                }
+                let cancelled = match self.sc.cancel_order(pair, &order.client_order_id).await {
+                    Ok(()) => true,
+                    Err(e) if e.to_string().contains("-2011") => {
+                        // already gone: FILLED or externally cancelled —
+                        // reduce whatever base it acquired instead of failing
+                        actions.push(format!(
+                            "orphan {} already gone; reducing acquired base",
+                            order.client_order_id
+                        ));
+                        false
+                    }
+                    Err(e) => return Err(e),
+                };
+                if cancelled {
+                    actions.push(format!("cancelled orphan entry {}", order.client_order_id));
+                }
+                let acquired = if order.status == "FILLED" {
+                    order.orig_qty
+                } else {
+                    order.executed_qty
+                };
+                if acquired >= filters.min_qty {
+                    // fill left acquired base naked — reduce it immediately (§6)
+                    let qty = crate::signed::round_qty_to_step(acquired, filters.step_size);
                     if qty > 0.0 {
                         let flatten_id = format!("tp-flat-{}", now_ms);
                         self.sc.market_sell(pair, qty, &flatten_id).await?;
@@ -316,6 +402,10 @@ impl Executor {
                 if p.symbol == *pair && p.phase == ENTRY_PHASE {
                     let status = self.sc.get_order(pair, &p.entry_client_id).await?;
                     if status.status == "FILLED" && !oco_live {
+                        if self.dry_run {
+                            actions.push(format!("DRY-RUN would place recovery OCO for {pair}"));
+                            continue;
+                        }
                         let list_id = self
                             .sc
                             .place_oco_sell(pair, p.qty, p.target, p.stop, &p.entry_client_id)
@@ -350,6 +440,12 @@ impl Executor {
         for pair in &self.strat.pairs {
             let filters = self.filters(pair).await?;
             let open_before = self.sc.open_orders(pair).await?.len();
+            if self.dry_run {
+                lines.push(format!(
+                    "DRY-RUN would flatten {pair} ({open_before} open orders)"
+                ));
+                continue;
+            }
             if open_before > 0 {
                 self.sc.cancel_all_orders(pair).await?;
             }

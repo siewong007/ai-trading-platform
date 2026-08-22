@@ -109,7 +109,9 @@ pub fn risk_pass(
     );
     let cap_notional = bt.max_notional_pct_equity * equity;
     if qty * plan.entry > cap_notional {
-        qty = cap_notional / plan.entry;
+        // re-floor to the exchange lot step, else every capped order is
+        // rejected server-side (-1013) for being off-grid
+        qty = round_qty_to_step(cap_notional / plan.entry, filters.step_size);
     }
     if qty * plan.entry < bt.min_notional_usd {
         return RiskDecision::Skip(BELOW_MIN_NOTIONAL_REASON.into());
@@ -210,11 +212,9 @@ mod tests {
         match d {
             RiskDecision::Place { qty, entry_limit } => {
                 assert_eq!(entry_limit, 101.0);
-                assert!(qty <= 100.0 / 101.0);
-                assert!(
-                    (qty * 101.0 - 100.0).abs() < 1e-6,
-                    "shrunk notional off cap: {qty}"
-                );
+                // 100/101 = 0.990099.. floored to step 0.5 => 0.5 (on-grid)
+                assert_eq!(qty, 0.5);
+                assert!(qty * 101.0 <= 100.0 + 1e-9);
             }
             other => panic!("expected Place, got {other:?}"),
         }
