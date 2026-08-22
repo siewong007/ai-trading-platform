@@ -1,3 +1,4 @@
+#![allow(dead_code)] // consumed by WS feed + upcoming CLI wiring
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -63,6 +64,10 @@ impl Cache {
             .map_or(0, Vec::len)
     }
 
+    pub fn is_empty(&self, symbol: &str, timeframe: &str) -> bool {
+        self.len(symbol, timeframe) == 0
+    }
+
     /// Backfill from sqlite (rows arrive time-sorted). Returns the row count.
     pub async fn hydrate_from_db(
         &self,
@@ -100,7 +105,11 @@ mod tests {
         cache.upsert(&mk(3000, 103.0), "BTCUSDT", "1h");
         cache.upsert(&mk(1000, 101.0), "BTCUSDT", "1h");
         cache.upsert(&mk(2000, 102.0), "BTCUSDT", "1h");
-        let ts: Vec<i64> = cache.series("BTCUSDT", "1h").iter().map(|c| c.open_time).collect();
+        let ts: Vec<i64> = cache
+            .series("BTCUSDT", "1h")
+            .iter()
+            .map(|c| c.open_time)
+            .collect();
         assert_eq!(ts, vec![1000, 2000, 3000]);
         assert_eq!(cache.len("BTCUSDT", "1h"), 3);
     }

@@ -1,3 +1,4 @@
+#![allow(dead_code)] // consumed by WS feed + upcoming CLI wiring
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
