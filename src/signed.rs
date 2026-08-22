@@ -81,6 +81,40 @@ pub struct PlacedOrder {
     pub executed_qty: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Phase 2 (executor) consumes these
+pub enum TimeInForce {
+    Gtc,
+    Ioc,
+    Fok,
+}
+
+impl std::fmt::Display for TimeInForce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimeInForce::Gtc => write!(f, "GTC"),
+            TimeInForce::Ioc => write!(f, "IOC"),
+            TimeInForce::Fok => write!(f, "FOK"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Phase 2 (executor) consumes these
+pub enum ExecInstruction {
+    Default,
+    PostOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)] // Phase 2 (executor) consumes these
+pub struct OrderSpec {
+    pub qty: f64,
+    pub limit_price: f64,
+    pub tif: TimeInForce,
+    pub instruction: ExecInstruction,
+}
+
 pub fn round_qty_to_step(qty: f64, step_size: f64) -> f64 {
     if step_size <= 0.0 || !qty.is_finite() || qty <= 0.0 {
         return 0.0;
@@ -245,6 +279,35 @@ impl SignedClient {
     }
 
     #[allow(dead_code)] // Phase 2 (executor) consumes this
+    pub async fn place_limit(
+        &self,
+        symbol: &str,
+        spec: &OrderSpec,
+        client_id: &str,
+    ) -> anyhow::Result<PlacedOrder> {
+        let qty_str = fmt_price(spec.qty);
+        let price_str = fmt_price(spec.limit_price);
+        let tif = spec.tif.to_string();
+        let otype = match spec.instruction {
+            ExecInstruction::Default => "LIMIT",
+            ExecInstruction::PostOnly => "LIMIT_MAKER",
+        };
+        let mut params: Vec<(&str, &str)> = vec![
+            ("symbol", symbol),
+            ("side", "BUY"),
+            ("type", otype),
+            ("quantity", qty_str.as_str()),
+            ("price", price_str.as_str()),
+            ("newClientOrderId", client_id),
+        ];
+        if spec.instruction == ExecInstruction::Default {
+            params.insert(3, ("timeInForce", tif.as_str()));
+        }
+        let body = self.signed_post("/api/v3/order", &params).await?;
+        placed_order_from(&body)
+    }
+
+    #[allow(dead_code)] // Phase 2 (executor) consumes this
     pub async fn place_limit_buy(
         &self,
         symbol: &str,
@@ -252,23 +315,17 @@ impl SignedClient {
         price: f64,
         client_id: &str,
     ) -> anyhow::Result<PlacedOrder> {
-        let qty_str = fmt_price(qty);
-        let price_str = fmt_price(price);
-        let body = self
-            .signed_post(
-                "/api/v3/order",
-                &[
-                    ("symbol", symbol),
-                    ("side", "BUY"),
-                    ("type", "LIMIT"),
-                    ("timeInForce", "GTC"),
-                    ("quantity", qty_str.as_str()),
-                    ("price", price_str.as_str()),
-                    ("newClientOrderId", client_id),
-                ],
-            )
-            .await?;
-        placed_order_from(&body)
+        self.place_limit(
+            symbol,
+            &OrderSpec {
+                qty,
+                limit_price: price,
+                tif: TimeInForce::Gtc,
+                instruction: ExecInstruction::Default,
+            },
+            client_id,
+        )
+        .await
     }
 
     #[allow(dead_code)] // Phase 2 (executor) consumes this
@@ -902,6 +959,103 @@ mod tests {
 
         let reqs = server.received_requests().await.unwrap();
         let query = reqs[0].url.query().unwrap();
+        let (prefix, sig) = query.split_once("&signature=").unwrap();
+        assert_eq!(sig, sign_query(SECRET, prefix));
+    }
+
+    #[test]
+    fn tif_display_maps_to_binance_wire_values() {
+        assert_eq!(TimeInForce::Gtc.to_string(), "GTC");
+        assert_eq!(TimeInForce::Ioc.to_string(), "IOC");
+        assert_eq!(TimeInForce::Fok.to_string(), "FOK");
+    }
+
+    #[tokio::test]
+    async fn place_limit_posts_ioc_and_fok_time_in_force() {
+        for tif in [TimeInForce::Ioc, TimeInForce::Fok] {
+            let server = MockServer::start().await;
+            let expected_tif = tif.to_string();
+            Mock::given(method("POST"))
+                .and(path("/api/v3/order"))
+                .and(query_param("symbol", "BTCUSDT"))
+                .and(query_param("side", "BUY"))
+                .and(query_param("type", "LIMIT"))
+                .and(query_param("timeInForce", expected_tif.as_str()))
+                .and(query_param("quantity", "0.01"))
+                .and(query_param("price", "40000.0"))
+                .and(query_param("newClientOrderId", "tp-tif-1700"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"orderId":4293155,"clientOrderId":"tp-tif-1700",
+                    "status":"NEW","executedQty":"0.00000000"}"#,
+                ))
+                .mount(&server)
+                .await;
+            let client = signed_client(&server.uri());
+            let o = client
+                .place_limit(
+                    "BTCUSDT",
+                    &OrderSpec {
+                        qty: 0.01,
+                        limit_price: 40_000.0,
+                        tif,
+                        instruction: ExecInstruction::Default,
+                    },
+                    "tp-tif-1700",
+                )
+                .await
+                .unwrap();
+            assert_eq!(o.order_id, 4_293_155);
+            assert_eq!(o.client_order_id, "tp-tif-1700");
+
+            let reqs = server.received_requests().await.unwrap();
+            let query = reqs[0].url.query().unwrap();
+            assert!(
+                query.contains(&format!("timeInForce={expected_tif}")),
+                "{query}"
+            );
+            let (prefix, sig) = query.split_once("&signature=").unwrap();
+            assert_eq!(sig, sign_query(SECRET, prefix));
+        }
+    }
+
+    #[tokio::test]
+    async fn place_limit_post_only_emits_limit_maker_without_time_in_force() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v3/order"))
+            .and(query_param("symbol", "BTCUSDT"))
+            .and(query_param("side", "BUY"))
+            .and(query_param("type", "LIMIT_MAKER"))
+            .and(query_param("quantity", "0.01"))
+            .and(query_param("price", "40000.0"))
+            .and(query_param("newClientOrderId", "tp-post-1700"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"orderId":4293156,"clientOrderId":"tp-post-1700",
+                "status":"NEW","executedQty":"0.00000000"}"#,
+            ))
+            .mount(&server)
+            .await;
+        let o = signed_client(&server.uri())
+            .place_limit(
+                "BTCUSDT",
+                &OrderSpec {
+                    qty: 0.01,
+                    limit_price: 40_000.0,
+                    tif: TimeInForce::Ioc,
+                    instruction: ExecInstruction::PostOnly,
+                },
+                "tp-post-1700",
+            )
+            .await
+            .unwrap();
+        assert_eq!(o.order_id, 4_293_156);
+
+        let reqs = server.received_requests().await.unwrap();
+        let query = reqs[0].url.query().unwrap();
+        assert!(
+            !query.contains("timeInForce"),
+            "Binance rejects TIF on LIMIT_MAKER: {query}"
+        );
         let (prefix, sig) = query.split_once("&signature=").unwrap();
         assert_eq!(sig, sign_query(SECRET, prefix));
     }
