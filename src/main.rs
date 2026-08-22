@@ -157,6 +157,20 @@ fn confirm_live(latest_pass: Option<bool>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn live_trade_permitted(latest_pass: Option<bool>) -> bool {
+    latest_pass == Some(true)
+}
+
+fn refuse_live_trade(latest_pass: Option<bool>) -> anyhow::Result<()> {
+    if live_trade_permitted(latest_pass) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{}\nlive trading refused until a stored overall gate PASS exists",
+        gate_banner(latest_pass)
+    );
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -196,6 +210,7 @@ async fn run_trade(config_path: &str, base: &str, dry_run: bool, once: bool) -> 
     let verdict = db.latest_search_overall_verdict().await?;
     println!("{}", gate_banner(verdict));
     if base == BINANCE_BASE {
+        refuse_live_trade(verdict)?;
         confirm_live(verdict)?;
     }
     let ex = Executor {
@@ -740,6 +755,32 @@ mod tests {
         assert!(!confirm_live_input("GO GO\n"));
         assert!(confirm_live_input("GO\n"));
         assert!(confirm_live_input("GO"));
+    }
+
+    #[test]
+    fn live_trade_permitted_only_on_stored_pass() {
+        assert!(!live_trade_permitted(None));
+        assert!(!live_trade_permitted(Some(false)));
+        assert!(live_trade_permitted(Some(true)));
+    }
+
+    #[test]
+    fn refuse_live_trade_errors_on_fail_and_missing_without_needing_go() {
+        for v in [None, Some(false)] {
+            let err = refuse_live_trade(v).unwrap_err().to_string();
+            assert!(
+                err.contains("live trading refused until a stored overall gate PASS exists"),
+                "{err}"
+            );
+            assert!(err.contains(&gate_banner(v)), "{err}");
+            assert!(!err.to_lowercase().contains("api_key"), "{err}");
+            assert!(!err.to_lowercase().contains("secret"), "{err}");
+        }
+    }
+
+    #[test]
+    fn refuse_live_trade_ok_on_pass_so_go_prompt_can_run() {
+        assert!(refuse_live_trade(Some(true)).is_ok());
     }
 
     async fn memory_db() -> Db {
