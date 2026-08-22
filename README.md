@@ -7,6 +7,12 @@ strategy with ATR stops), built around an honest pre-registered backtest gate.
 Testnet-first by design: `trade` defaults to `https://testnet.binance.vision`;
 live requires `--live` plus typing the literal word `GO`.
 
+> **Research-only freeze (2026-08-22):** live trading is **refused in code**
+> until a stored overall gate PASS exists — `GO` cannot override FAIL or a
+> missing verdict. The remaining 8 variant slots (12/20 used) are reserved for
+> a documented new out-of-sample study; `search` refuses new config hashes
+> unless invoked with `--unlock-new-study` and the literal stdin word `NEW-OOS`.
+
 ## Commands
 
 | Command | Purpose |

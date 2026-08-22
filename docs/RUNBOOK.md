@@ -5,9 +5,12 @@ fully once before the first testnet run.
 
 ## 0. Status warning
 
-The pre-registered gate verdict is **NO-GO**. Per spec §5, live trading is NOT
-advised; every `trade`/`flatten` launch prints the stored verdict banner.
-Testnet use is the sanctioned stage until a PASS gate exists on record.
+**Research-only freeze:** live trading is **blocked in code**, not merely
+"not advised" — `trade --live` exits with an error before any prompt unless a
+stored overall gate PASS exists (spec 2026-08-22 freeze). Testnet remains the
+sanctioned engine stage; dry-run/testnet fills never count toward the gate.
+The remaining 8 variant slots are reserved for a documented new OOS study
+(`search --unlock-new-study`, stdin `NEW-OOS`) — see the freeze spec §5–§6.
 
 ## 1. API key creation checklist (verbatim spec §7)
 
