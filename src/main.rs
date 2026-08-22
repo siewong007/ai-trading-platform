@@ -1,5 +1,6 @@
 mod backtest;
 mod bus;
+mod cache;
 mod db;
 mod exchange;
 mod executor;
