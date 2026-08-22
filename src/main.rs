@@ -10,6 +10,7 @@ mod risk;
 mod signed;
 mod strategy;
 mod types;
+mod ws;
 
 use backtest::{run, BacktestOutput};
 use clap::{Parser, Subcommand};
