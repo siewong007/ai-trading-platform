@@ -5,12 +5,11 @@ fully once before the first testnet run.
 
 ## 0. Status warning
 
-**Research-only freeze:** live trading is **blocked in code**, not merely
-"not advised" — `trade --live` exits with an error before any prompt unless a
-stored overall gate PASS exists (spec 2026-08-22 freeze). Testnet remains the
-sanctioned engine stage; dry-run/testnet fills never count toward the gate.
-The remaining 8 variant slots are reserved for a documented new OOS study
-(`search --unlock-new-study`, stdin `NEW-OOS`) — see the freeze spec §5–§6.
+The pre-registered gate verdict is **NO-GO**. `trade --live` exits non-zero
+until a stored overall PASS exists (`GO` cannot override). `flatten --live`
+remains the kill switch (still requires typed `GO`). Testnet is the sanctioned
+engine stage. Variant budget: 12/20 used; remaining 8 are reserved — do not
+run `search --unlock-new-study` on this OOS window.
 
 ## 1. API key creation checklist (verbatim spec §7)
 
