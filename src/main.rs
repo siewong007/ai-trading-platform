@@ -55,6 +55,14 @@ enum Command {
         #[arg(long)]
         unlock_new_study: bool,
     },
+    /// Permutation significance of a config's simulated PnL
+    Permutetest {
+        #[arg(long, default_value = "config/strategy_ema_rsi.toml")]
+        config: String,
+        #[arg(long, default_value_t = 200)]
+        trials: usize,
+    },
+
     /// Dump the research ledger (budget, hashes, windows, halts)
     Report {
         /// emit human-readable markdown instead of JSON
@@ -108,6 +116,9 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     match cli.command {
         Command::Fetch { config } => rt.block_on(run_fetch(&config))?,
+        Command::Permutetest { config, trials } => {
+            rt.block_on(run_permutetest(&config, trials))?;
+        }
         Command::Report { md } => {
             let db = rt.block_on(Db::open_default())?;
             let ledger = rt.block_on(db.ledger())?;
@@ -553,6 +564,117 @@ fn print_folds(results: &[PairResult], folds: usize) {
     println!("RANKING IS ANALYSIS ONLY — fold spread is a robustness signal, not a gate input.");
 }
 
+
+/// xorshift64* — deterministic, dependency-free RNG for permutation tests.
+pub struct XorShift(u64);
+impl XorShift {
+    pub fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+    pub fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+    /// k distinct indices sampled from 0..n (partial Fisher-Yates)
+    pub fn sample_distinct(&mut self, n: usize, k: usize) -> Vec<usize> {
+        let mut pool: Vec<usize> = (0..n).collect();
+        let k = k.min(n);
+        for i in 0..k {
+            let j = i + (self.next_u64() % ((n - i) as u64)) as usize;
+            pool.swap(i, j);
+        }
+        pool.truncate(k);
+        pool
+    }
+}
+
+fn aggregate_pnl(candles_by_pair: &[(String, Vec<crate::types::Candle>)],
+                 strat: &StrategySection,
+                 bt: &BacktestSection,
+                 signals_by_pair: &[Vec<Option<crate::strategy::TradePlan>>]) -> f64 {
+    candles_by_pair
+        .iter()
+        .zip(signals_by_pair)
+        .map(|((_, cs), sigs)| crate::backtest::run_with_signals(cs, strat, bt, sigs.clone())
+            .trades.iter().map(|t| t.pnl).sum::<f64>())
+        .sum()
+}
+
+async fn run_permutetest(config_path: &str, trials: usize) -> anyhow::Result<()> {
+    let cfg = StrategyConfig::load(config_path)?;
+    let db = Db::open_default().await?;
+    anyhow::ensure!(trials >= 10, "need at least 10 trials");
+    let mut by_pair: Vec<(String, Vec<crate::types::Candle>)> = Vec::new();
+    let mut real_sigs: Vec<Vec<Option<crate::strategy::TradePlan>>> = Vec::new();
+    for pair in &cfg.strategy.pairs {
+        let candles = load_series(&db, pair, &cfg.strategy.timeframe).await?;
+        let sigs = crate::strategy::generate_signals(&candles, &cfg.strategy);
+        if sigs.iter().any(|s| s.is_some()) {
+            by_pair.push((pair.clone(), candles));
+            real_sigs.push(sigs);
+        }
+    }
+    anyhow::ensure!(!by_pair.is_empty(), "config produced no signals to permute");
+
+    // valid slots: any candle index where the original family could emit a
+    // signal — conservatively the observed min..len-2 band
+    let actual = aggregate_pnl(&by_pair, &cfg.strategy, &cfg.backtest, &real_sigs);
+    let mut rng = XorShift::new(0x9E37_79B9_7F4A_7C15 ^ trials as u64);
+    let mut null: Vec<f64> = Vec::with_capacity(trials);
+    let rng_state = std::cell::RefCell::new(&mut rng);
+    let pairs_n = by_pair.len();
+    for _ in 0..trials {
+        let mut sigs: Vec<Vec<Option<crate::strategy::TradePlan>>> =
+            vec![vec![None; 0]; pairs_n];
+        {
+            let mut r = rng_state.borrow_mut();
+            for (pi, (_, cs)) in by_pair.iter().enumerate() {
+                let plan_slots: Vec<usize> = real_sigs[pi]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.is_some())
+                    .map(|(i, _)| i)
+                    .collect();
+                let plans: Vec<crate::strategy::TradePlan> = plan_slots
+                    .iter()
+                    .map(|&i| real_sigs[pi][i].unwrap())
+                    .collect();
+                let lo = plan_slots.first().copied().unwrap_or(1);
+                let hi = cs.len().saturating_sub(2);
+                let n_slots = hi.saturating_sub(lo);
+                let mut v: Vec<Option<crate::strategy::TradePlan>> = vec![None; cs.len()];
+                if n_slots > 0 && !plans.is_empty() {
+                    for idx in r.sample_distinct(n_slots, plans.len()) {
+                        v[lo + idx] = Some(plans[idx % plans.len()]);
+                    }
+                }
+                sigs[pi] = v;
+            }
+        }
+        null.push(aggregate_pnl(&by_pair, &cfg.strategy, &cfg.backtest, &sigs));
+    }
+    drop(rng_state);
+    let ge = null.iter().filter(|&&p| p >= actual).count();
+    let mean = null.iter().sum::<f64>() / null.len() as f64;
+    let var = null.iter().map(|p| (p - mean) * (p - mean)).sum::<f64>() / null.len() as f64;
+    println!("PERMUTATION TEST ({trials} trials, deterministic seed)");
+    println!("actual aggregate pnl : {actual:+.2}");
+    println!("null mean/std        : {mean:+.2} / {:.2}", var.sqrt());
+    println!("null p-value         : {}/{} = {:.3}", ge, null.len(),
+        ge as f64 / null.len() as f64);
+    println!(
+        "verdict: {}",
+        if ge == 0 { "p < 1/trials — strong evidence of edge" }
+        else if (ge as f64) / (null.len() as f64) < 0.05 { "significant at 0.05" }
+        else { "NOT distinguishable from luck" }
+    );
+    Ok(())
+}
+
 async fn run_backtest(config_path: &str) -> anyhow::Result<Vec<PairResult>> {
     let cfg = StrategyConfig::load(config_path)?;
     let db = Db::open_default().await?;
@@ -789,6 +911,22 @@ async fn run_export(out: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xorshift_deterministic_and_sample_distinct_exact() {
+        let mut a = super::XorShift::new(42);
+        let mut b = super::XorShift::new(42);
+        for _ in 0..8 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+        let mut r = super::XorShift::new(7);
+        let s1 = r.sample_distinct(100, 10);
+        assert_eq!(s1.len(), 10);
+        let uniq: std::collections::HashSet<_> = s1.iter().collect();
+        assert_eq!(uniq.len(), 10, "sampled indices must be distinct");
+        assert!(s1.iter().all(|&i| i < 100));
+        assert_eq!(r.sample_distinct(5, 99).len(), 5, "k clamped to n");
+    }
 
     #[test]
     fn fold_bounds_partitions_evenly_and_covers_span() {
