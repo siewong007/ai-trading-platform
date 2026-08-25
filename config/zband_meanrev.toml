@@ -1,0 +1,21 @@
+# zband_meanrev — z-score band fade (spec: docs/superpowers/specs/2026-08-25-zband-meanrev-design.md)
+# Grid points vary ONLY lookback_bars × z_entry; everything else fixed.
+[strategy]
+name = "zband_meanrev"
+pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+timeframe = "1h"
+lookback_bars = 48
+z_entry = 2.0
+ema_fast = 50
+ema_slow = 200
+rsi_period = 14
+rsi_entry_threshold = 35.0
+atr_period = 14
+atr_multiplier = 2.0
+risk_reward_ratio = 1.5
+
+[backtest]
+start_equity_usd = 200.0
+risk_per_trade_usd = 2.0
+max_notional_pct_equity = 0.5
+min_notional_usd = 15.0
