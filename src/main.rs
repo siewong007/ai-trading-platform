@@ -79,6 +79,12 @@ enum Command {
         slip_bps: Option<f64>,
     },
 
+    /// Walk-forward selection-stability across registered family grids
+    Wfselect {
+        #[arg(long, default_value_t = 90)]
+        quarter_days: u64,
+    },
+
     /// Permutation significance of a config's simulated PnL
     Permutetest {
         #[arg(long, default_value = "config/strategy_ema_rsi.toml")]
@@ -145,6 +151,9 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Fetch { config, interval, lookback_days } => {
             rt.block_on(run_fetch(&config, interval, lookback_days))?
+        }
+        Command::Wfselect { quarter_days } => {
+            rt.block_on(run_wfselect(quarter_days))?;
         }
         Command::Permutetest { config, trials, fee_bps, slip_bps } => {
             rt.block_on(run_permutetest(&config, trials, fee_bps, slip_bps))?;
@@ -838,6 +847,96 @@ async fn run_sensitivity(
 }
 
 
+
+async fn run_wfselect(quarter_days: u64) -> anyhow::Result<()> {
+    let cfg_paths = [
+        "config/strategy_ema_rsi.toml",
+        "config/zband_meanrev.toml",
+        "config/session_ema_rsi.toml",
+        "config/donchian_vol.toml",
+    ];
+    let db = Db::open_default().await?;
+    let q_ms = (quarter_days as i64) * 86_400_000;
+    let mut cands: Vec<(String, Vec<crate::backtest::TradeRecord>)> = Vec::new();
+    for p in cfg_paths {
+        let cfg = StrategyConfig::load(p)?;
+        let Some(fam) = crate::strategy::find_family(&cfg.strategy.name) else {
+            continue;
+        };
+        for job in fam.grid_jobs(&cfg) {
+            let mut all: Vec<crate::backtest::TradeRecord> = Vec::new();
+            for pair in &job.strat.pairs {
+                let candles = load_series(&db, pair, &job.strat.timeframe).await?;
+                all.extend(crate::backtest::run(&candles, &job.strat, &cfg.backtest).trades);
+            }
+            cands.push((format!("{}/{}", job.strat.name, job.label), all));
+        }
+    }
+    anyhow::ensure!(!cands.is_empty(), "no candidates");
+    // global time span from union of trades
+    let t_min = cands.iter().flat_map(|(_, t)| t.iter().map(|x| x.entry_ts)).min();
+    let t_max = cands.iter().flat_map(|(_, t)| t.iter().map(|x| x.exit_ts)).max();
+    let (Some(t0), Some(t1)) = (t_min, t_max) else {
+        anyhow::bail!("no trades anywhere");
+    };
+    println!(
+        "WALK-FORWARD SELECTION ({} candidates, {}-day quarters, free paths)",
+        cands.len(),
+        quarter_days
+    );
+    // decisions every quarter after 2 warmup quarters
+    let mut cut = t0 + 2 * q_ms;
+    let mut picks_total = 0usize;
+    let mut same_streak = 0usize;
+    let mut max_streak = 0usize;
+    let mut last_pick = String::new();
+    let mut oos_sum = 0.0;
+    let mut rows: Vec<(i64, String, f64, f64)> = Vec::new(); // cut,label,is_pnl,oos_pnl
+    while cut + q_ms <= t1 {
+        let mut best = (String::new(), f64::NEG_INFINITY);
+        for (label, tr) in &cands {
+            let is_pnl: f64 = tr
+                .iter()
+                .filter(|t| t.entry_ts >= cut - 2 * q_ms && t.entry_ts < cut)
+                .map(|t| t.pnl)
+                .sum();
+            if is_pnl > best.1 {
+                best = (label.clone(), is_pnl);
+            }
+        }
+        if best.1 == f64::NEG_INFINITY {
+            cut += q_ms;
+            continue;
+        }
+        let (_, tr) = cands.iter().find(|(l, _)| *l == best.0).unwrap();
+        let oos: f64 = tr
+            .iter()
+            .filter(|t| t.entry_ts >= cut && t.entry_ts < cut + q_ms)
+            .map(|t| t.pnl)
+            .sum();
+        picks_total += 1;
+        if best.0 == last_pick {
+            same_streak += 1;
+            max_streak = max_streak.max(same_streak);
+        } else {
+            same_streak = 0;
+        }
+        last_pick = best.0.clone();
+        oos_sum += oos;
+        rows.push((cut, best.0.clone(), best.1, oos));
+        let d = chrono::DateTime::from_timestamp_millis(cut)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        println!("{} pick {:<34} IS {:+8.2}  next-q {:+8.2}", d, best.0, best.1, oos);
+        cut += q_ms;
+    }
+    println!("\nselection churn: {} switches over {} decisions", 
+        rows.windows(2).filter(|w| w[0].1 != w[1].1).count(), picks_total);
+    println!("walk-forward picked-OOS total: {oos_sum:+.2}");
+    println!("RANKING IS ANALYSIS ONLY — not a gate input.");
+    Ok(())
+}
+
 fn bt_with_costs(base: &BacktestSection, fee_bps: Option<f64>, slip_bps: Option<f64>)
     -> BacktestSection {
     let mut bt = base.clone();
@@ -848,10 +947,6 @@ fn bt_with_costs(base: &BacktestSection, fee_bps: Option<f64>, slip_bps: Option<
         bt.slippage = Some(sl / 10_000.0);
     }
     bt
-}
-
-async fn run_backtest(config_path: &str) -> anyhow::Result<Vec<PairResult>> {
-    run_backtest_cfg(config_path, None, None).await
 }
 
 async fn run_backtest_cfg(

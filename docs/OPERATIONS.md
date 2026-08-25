@@ -25,7 +25,15 @@ internal disk. After any config change: copy TOML into
 | com.tradingplatform.dashboard | 60 s | render `~/trading-engine/dashboard.html` (self-contained HTML, auto-refreshing tab) |
 | com.tradingplatform.tgbot | long-poll (KeepAlive) | Telegram reporter + entry/fill alert watcher (~60 s latency) |
 | com.tradingplatform.research | 6 h | measurement suite on all four families → `research_history.log`; Telegram push only on change (verdict / p-value fingerprint) |
+| com.tradingplatform.maintenance | daily | SQLite-safe backups (14-day retention) + /tmp log rotation |
 | com.tradingplatform.oos | daily | live out-of-sample scoreboard for the frozen `session_ema_rsi` grid over the disjoint window (≥ 2026-08-26); kline-gap scan; weekly permutation refresh (`~/trading-engine/oos_scoreboard.json`) |
+
+**Cost-counterfactual & selection-stability tools:**
+`backtest|permutetest|sensitivity --fee-bps F --slip-bps S` re-measure under
+alternative execution costs (maker-style: `--fee-bps 7.5 --slip-bps 0`).
+`wfselect --quarter-days 90` tests whether trailing-window re-selection
+would have kept picking winners (2026-08 finding: it churns and loses —
+pre-registration beats adaptive tuning at taker costs).
 
 **Deploying code changes:** `~/trading-engine/deploy.sh` rebuilds the
 release binary, syncs all family TOMLs into the engine dir, and kickstarts
