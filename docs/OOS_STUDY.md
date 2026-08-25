@@ -80,6 +80,44 @@ the full OOS). Any hour-conditioned successor family must be designed,
 frozen, and tested on a disjoint future window like every other — this note
 is a hypothesis registration, not a result.
 
+## Gen-2 candidates — measured free, freeze memo (2026-08-25)
+
+Two new families developed per
+[gen-2 design](superpowers/specs/2026-08-25-research-gen2-design.md).
+All measurements on the deep cache (OOS ≈ 2024-10 → 2026-08), zero budget
+spent.
+
+### donchian_vol (breakout continuation) — ABANDON
+
+Gate FAIL · folds negative in most cells · permutation actual −252.1 vs
+null −185.4 ± 22.2, **p = 1.000**. Same signature as gen-1: systematically
+worse than random entries. Never spends slots.
+
+### session_ema_rsi (hour-gated pullback) — FIRST SIGNIFICANT SEPARATION
+
+Gate FAIL on trade-count floor only (frequency starved by design).
+Permutation: **actual +11.45 vs null −12.43 ± 8.16, p = 0.015** — first
+config in project history to separate from luck at 0.05. Fold view: profits
+concentrated in early folds; aggregate ≈ breakeven-to-slightly-positive.
+
+**Honest caveats:** (1) the window was selected from bucket analysis ON this
+same data — the permutation partially self-fulfills, so the true edge is
+almost certainly smaller than +11 suggests and may be zero; (2) thin counts
+per pair (floor unmet); (3) sensitivity: base slightly negative, neighbors
+mixed — no clean plateau.
+
+### Freeze memo (operator decision required before any unlock)
+
+| Item | Recommendation |
+|---|---|
+| zband_meanrev (6 reserved) | formally abandon: worse-than-random, DD 64% |
+| donchian_vol | abandoned pre-registration (measured free) |
+| session_ema_rsi (3 frozen) | SPEND — the only candidate with positive separation |
+| Resulting budget | 12 + 3 = 15/20 used; 5 spare |
+
+Study window for the session_ema_rsi unlock must be disjoint from all data
+through 2026-08-25 and documented here before `--unlock-new-study`.
+
 ## Honest expectation (recorded 2026-08-25)
 
 All 12 known variants have worst-pair OOS PF ≤ 0.89 after costs — below
