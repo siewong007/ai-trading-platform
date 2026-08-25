@@ -115,6 +115,23 @@ fn main() -> anyhow::Result<()> {
                 println!("# research ledger");
                 println!("- budget: {}/20", ledger["variant_budget_used"]);
                 println!("- distinct configs: {}", ledger["distinct_hashes"]);
+                let pfs: Vec<f64> = ledger["hashes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|h| h["results"].as_array().unwrap().iter())
+                    .filter_map(|r| r["oos_pf"].as_f64())
+                    .collect();
+                if let Some(exp) = crate::metrics::luck_adjusted_best_pf(&pfs) {
+                    let observed = pfs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    println!(
+                        "- luck-adjusted best PF by chance ({} trials): {:.2}; observed best: {:.2} {}",
+                        pfs.len(),
+                        exp,
+                        observed,
+                        if observed > exp { "→ beats luck" } else { "→ within luck" }
+                    );
+                }
                 for h in ledger["hashes"].as_array().unwrap() {
                     let sym: Vec<String> = h["results"]
                         .as_array()

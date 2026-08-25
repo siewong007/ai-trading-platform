@@ -79,6 +79,67 @@ pub struct GateVerdict {
     pub notes: Vec<String>,
 }
 
+/// Error function, Abramowitz & Stegun 7.1.26 (|eps| < 1.5e-7).
+fn erf(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let a1 = 0.254829592;
+    let a2 = -0.284496736;
+    let a3 = 1.421413741;
+    let a4 = -1.453152027;
+    let a5 = 1.061405429;
+    let p = 0.3275911;
+    let t = 1.0 / (1.0 + p * x);
+    // A&S 7.1.26: erf(x) = 1 - (a1 t + a2 t^2 + a3 t^3 + a4 t^4 + a5 t^5) e^{-x^2}
+    let poly = (((a5 * t + a4) * t + a3) * t + a2) * t + a1;
+    let y = 1.0 - poly * t * (-x * x).exp();
+    sign * y
+}
+
+/// Expected maximum of `t` iid standard normals, by Simpson integration of
+/// the order-statistic density t·x·φ(x)·Φ(x)^(t-1); 0 for t<2.
+pub fn expected_max_normal(t: usize) -> f64 {
+    if t < 2 {
+        return 0.0;
+    }
+    let tf = t as f64;
+    let phi = |x: f64| (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    let cdf = |x: f64| 0.5 * (1.0 + erf(x / std::f64::consts::SQRT_2));
+    let f = |x: f64| tf * x * phi(x) * cdf(x).powf(tf - 1.0);
+    let (a, b) = (-9.0f64, 9.0f64);
+    let n = 600usize; // even
+    let h = (b - a) / n as f64;
+    let sum: f64 = (0..=n)
+        .map(|i| {
+            let x = a + i as f64 * h;
+            let w = if i == 0 || i == n {
+                1.0
+            } else if i % 2 == 1 {
+                4.0
+            } else {
+                2.0
+            };
+            w * f(x)
+        })
+        .sum();
+    h / 3.0 * sum
+}
+
+pub fn luck_adjusted_best_pf(pfs: &[f64]) -> Option<f64> {
+    let n = pfs.len();
+    if n == 0 {
+        return None;
+    }
+    // degenerate PFs (0.0 = no trades) carry no dispersion information
+    let live: Vec<f64> = pfs.iter().copied().filter(|p| *p > 0.0).collect();
+    if live.is_empty() {
+        return None;
+    }
+    let m = live.iter().sum::<f64>() / live.len() as f64;
+    let var = live.iter().map(|p| (p - m) * (p - m)).sum::<f64>() / live.len() as f64;
+    Some(m + expected_max_normal(n) * var.sqrt())
+}
+
 pub fn evaluate_gate(reports: &[PairReport]) -> GateVerdict {
     let mut reasons = Vec::new();
     let mut notes = Vec::new();
@@ -156,6 +217,33 @@ pub fn evaluate_gate(reports: &[PairReport]) -> GateVerdict {
 mod tests {
     use super::*;
     use crate::backtest::ExitReason;
+
+    #[test]
+    fn expected_max_normal_known_shapes() {
+        assert_eq!(expected_max_normal(0), 0.0);
+        assert_eq!(expected_max_normal(1), 0.0);
+        let e2 = expected_max_normal(2);
+        assert!((e2 - 0.564).abs() < 0.05, "E[max of 2]≈0.564, got {e2}");
+        let e12 = expected_max_normal(12);
+        assert!(e12 > expected_max_normal(10) && (1.3..=1.7).contains(&e12),
+            "t=12 should be ≈1.5σ, got {e12}");
+        assert!(expected_max_normal(100) > expected_max_normal(50));
+    }
+
+    #[test]
+    fn luck_adjusted_uses_dispersion_of_live_pfs() {
+        // identical pfs -> zero dispersion -> expectation equals the mean
+        let flat = vec![1.0, 1.0, 1.0, 1.0];
+        let a = luck_adjusted_best_pf(&flat).unwrap();
+        assert!((a - 1.0).abs() < 1e-9);
+        // degenerate zeros are excluded from dispersion
+        let mixed = vec![1.0, 1.0, 0.0, 0.0];
+        let b = luck_adjusted_best_pf(&mixed).unwrap();
+        assert!((b - 1.0).abs() < 1e-9);
+        assert!(luck_adjusted_best_pf(&[0.0, 0.0]).is_none());
+        assert!(luck_adjusted_best_pf(&[]).is_none());
+    }
+
 
     fn tr(pnl: f64) -> TradeRecord {
         TradeRecord {
