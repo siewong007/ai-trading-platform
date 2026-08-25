@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS backtest_runs(
   oos_pf REAL NOT NULL,
   oos_pnl REAL NOT NULL,
   oos_dd REAL NOT NULL,
+  lookback_bars INTEGER,
+  z_entry REAL,
   ran_at INTEGER NOT NULL
 );
 "#;
@@ -97,6 +99,18 @@ impl Db {
             .connect(url)
             .await?;
         sqlx::query(SCHEMA).execute(&pool).await?;
+        // idempotent migrations for DBs created before the zband family
+        for ddl in [
+            "ALTER TABLE backtest_runs ADD COLUMN lookback_bars INTEGER",
+            "ALTER TABLE backtest_runs ADD COLUMN z_entry REAL",
+        ] {
+            if let Err(e) = sqlx::query(ddl).execute(&pool).await {
+                let msg = format!("{e}");
+                if !msg.contains("duplicate column name") {
+                    return Err(e.into());
+                }
+            }
+        }
         Ok(Self { pool })
     }
 
@@ -267,6 +281,8 @@ pub struct BacktestRunRow {
     pub rsi_entry: f64,
     pub atr_mult: f64,
     pub rr: f64,
+    pub lookback_bars: Option<i64>,
+    pub z_entry: Option<f64>,
     pub oos_trades: i64,
     pub oos_pf: f64,
     pub oos_pnl: f64,
@@ -306,14 +322,16 @@ impl Db {
                 .await?;
             sqlx::query(
                 "INSERT INTO backtest_runs(config_hash,symbol,rsi_entry,atr_mult,rr,
-                 oos_trades,oos_pf,oos_pnl,oos_dd,ran_at)
-                 VALUES(?,?,?,?,?,?,?,?,?,?)",
+                 lookback_bars,z_entry,oos_trades,oos_pf,oos_pnl,oos_dd,ran_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             )
             .bind(config_hash)
             .bind(&r.symbol)
             .bind(r.rsi_entry)
             .bind(r.atr_mult)
             .bind(r.rr)
+            .bind(r.lookback_bars)
+            .bind(r.z_entry)
             .bind(r.oos_trades)
             .bind(r.oos_pf)
             .bind(r.oos_pnl)
@@ -457,11 +475,39 @@ mod tests {
             rsi_entry: 35.0,
             atr_mult: 2.0,
             rr: 1.5,
+            lookback_bars: None,
+            z_entry: None,
             oos_trades: 25,
             oos_pf: 1.4,
             oos_pnl: pnl,
             oos_dd: 5.0,
         }
+    }
+
+    #[tokio::test]
+    async fn band_columns_round_trip() {
+        let db = Db::open("sqlite::memory:").await.unwrap();
+        let rows = vec![BacktestRunRow {
+            symbol: "BTCUSDT".into(),
+            rsi_entry: 35.0,
+            atr_mult: 2.0,
+            rr: 1.5,
+            lookback_bars: Some(48),
+            z_entry: Some(2.0),
+            oos_trades: 21,
+            oos_pf: 1.4,
+            oos_pnl: 5.0,
+            oos_dd: 3.0,
+        }];
+        db.record_backtest_results("zbhash", &rows).await.unwrap();
+        let stored = sqlx::query(
+            "SELECT lookback_bars, z_entry FROM backtest_runs WHERE config_hash='zbhash'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.get::<Option<i64>, _>("lookback_bars"), Some(48));
+        assert_eq!(stored.get::<Option<f64>, _>("z_entry"), Some(2.0));
     }
 
     async fn scalar(db: &Db, sql: &'static str) -> i64 {
