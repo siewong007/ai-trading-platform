@@ -329,7 +329,7 @@ impl Db {
             sqlx::query(
                 "INSERT INTO backtest_runs(config_hash,symbol,rsi_entry,atr_mult,rr,
                  lookback_bars,z_entry,oos_start_ts,oos_end_ts,oos_trades,oos_pf,oos_pnl,oos_dd,ran_at)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             )
             .bind(config_hash)
             .bind(&r.symbol)
