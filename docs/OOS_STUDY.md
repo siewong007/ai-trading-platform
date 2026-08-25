@@ -52,6 +52,34 @@ printf 'NEW-OOS\n' | <target-dir>/trading_platform search \
   --config config/strategy_ema_rsi.toml --unlock-new-study
 ```
 
+## Deep-history regime change (recorded 2026-08-25 16:30 UTC)
+
+Cache extended via `fetch --lookback-days 2200` (new CLI flag): 52,780
+candles/pair spanning 2020-08-16 → 2026-08-25 — six years, multiple full
+cycles. IS/OOS split recomputes automatically: **OOS is now ≈ 22 months
+(2024-10 → 2026-08)** instead of 5.4 months. All free-path measurements
+below run on this deeper basis. The reserved-slot study policy is
+UNCHANGED: its window must still start after the last studied window ends
+(≥ 2026-08-25), operator-documented before unlock.
+
+### Deep-basis verdicts (free paths, informational)
+
+| Family | Gate | Folds K=6 | Permutation (200) | Attribution |
+|---|---|---|---|---|
+| ema_rsi_pullback | FAIL | mixed, net negative | actual −170.6 vs null −48.2 ± 14.1, **p = 1.000** | worst buckets 20h/12h UTC |
+| zband_meanrev | FAIL (DD 64%!) | negative in 27/30 cells | actual −765.6 vs null −684.1 ± 36.0, **p = 0.995** | all six buckets negative |
+
+**Key inference:** with p ≈ 1.00, BOTH families place trades *systematically
+worse than random entries with identical exits*. This is not absence of
+edge — it is measured negative signal content at 1h frequency for these
+indicator logics. Six years of evidence across two orthogonal families.
+
+**Registered lead (NOT tuned, NOT celebrated):** the only positive session
+bucket anywhere is ema_rsi entries in the 00–04h UTC window (+15.11 across
+the full OOS). Any hour-conditioned successor family must be designed,
+frozen, and tested on a disjoint future window like every other — this note
+is a hypothesis registration, not a result.
+
 ## Honest expectation (recorded 2026-08-25)
 
 All 12 known variants have worst-pair OOS PF ≤ 0.89 after costs — below
