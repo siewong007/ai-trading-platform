@@ -1,4 +1,4 @@
-use crate::indicators::{atr, ema, rsi};
+use crate::indicators::{atr, ema, rolling_stats, rsi};
 use crate::types::Candle;
 use serde::Deserialize;
 
@@ -98,7 +98,84 @@ pub struct TradePlan {
 
 /// Evaluate strategy over a closed-candle series.
 /// Output[i] = Some(plan) when a long entry triggers on candle i's close.
+/// Family dispatcher: strategy TOML selects the signal engine by name.
 pub fn generate_signals(candles: &[Candle], cfg: &StrategySection) -> Vec<Option<TradePlan>> {
+    if cfg.name == "zband_meanrev" {
+        generate_zband_signals(candles, cfg)
+    } else {
+        generate_ema_rsi_signals(candles, cfg)
+    }
+}
+
+/// Vol-spike veto constants — FIXED, deliberately not grid dimensions (spec).
+const VETO_ATR_MULT: f64 = 1.5;
+const VETO_MEDIAN_BARS: usize = 100;
+
+/// Long-only z-score band fade (spec 2026-08-25): enter when close sinks
+/// `z_entry` sigmas below the trailing mean, targeting a fade back to that
+/// mean, ATR stop below. Refuses entries while volatility is spiking.
+pub fn generate_zband_signals(
+    candles: &[Candle],
+    cfg: &StrategySection,
+) -> Vec<Option<TradePlan>> {
+    let n = candles.len();
+    let mut out: Vec<Option<TradePlan>> = vec![None; n];
+    let lookback = cfg.lookback_bars.unwrap_or(48);
+    let z_entry = cfg.z_entry.unwrap_or(2.0);
+    let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
+    let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
+    let lows: Vec<f64> = candles.iter().map(|c| c.low).collect();
+    let (means, stds) = rolling_stats(&closes, lookback);
+    let atr_v = atr(&highs, &lows, &closes, cfg.atr_period);
+
+    // warmup: full stats window plus enough ATR history for the veto median
+    let warmup = lookback.max(cfg.atr_period + VETO_MEDIAN_BARS + 1);
+    for i in warmup..n {
+        let (Some(m), Some(s)) = (means[i], stds[i]) else {
+            continue;
+        };
+        if s <= 0.0 {
+            continue;
+        }
+        let Some(a) = atr_v[i] else { continue };
+        let Some(atr_med) = option_median(&atr_v[i - VETO_MEDIAN_BARS..i]) else {
+            continue;
+        };
+        if a > VETO_ATR_MULT * atr_med {
+            continue; // active crash — do not catch knives
+        }
+        if (closes[i] - m) / s > -z_entry {
+            continue;
+        }
+        let entry = closes[i];
+        let stop = entry - cfg.atr_multiplier * a;
+        if stop >= entry {
+            continue;
+        }
+        out[i] = Some(TradePlan {
+            entry,
+            stop,
+            target: m,
+        });
+    }
+    out
+}
+
+/// Median of present values; None when nothing present. Even lengths
+/// average the two middle order statistics.
+fn option_median(vals: &[Option<f64>]) -> Option<f64> {
+    let mut v: Vec<f64> = vals.iter().filter_map(|x| *x).collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    Some((v[(v.len() - 1) / 2] + v[v.len() / 2]) / 2.0)
+}
+
+fn generate_ema_rsi_signals(
+    candles: &[Candle],
+    cfg: &StrategySection,
+) -> Vec<Option<TradePlan>> {
     let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
     let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
     let lows: Vec<f64> = candles.iter().map(|c| c.low).collect();
@@ -388,5 +465,101 @@ min_notional_usd = 15.0
         let mut m = a.clone();
         m.strategy.z_entry = Some(2.5);
         assert_ne!(a.config_hash(), m.config_hash(), "z_entry must change hash");
+    }
+
+    fn zband_cfg() -> StrategySection {
+        StrategySection {
+            lookback_bars: Some(48),
+            z_entry: Some(2.0),
+            ..test_cfg()
+        }
+    }
+
+    #[test]
+    fn zband_fires_on_gradual_dip_via_dispatch() {
+        // NOTE (why this shape): a pure linear ramp never exceeds z ≈ -√3, and
+        // any steep drop spikes TR above the veto if the baseline is calm.
+        // So: choppy baseline (alternating ±0.5) keeps median ATR ≈ 2, then an
+        // 11-bar slide of −1/bar stays under the veto (TR ≈ 2 ≤ 1.5×median)
+        // while pushing z past −2 by convex accumulation.
+        let mut cfg = zband_cfg();
+        cfg.name = "zband_meanrev".into();
+        cfg.atr_period = 3;
+        let mut cs: Vec<Candle> = Vec::new();
+        let mut i = 0usize;
+        for _ in 0..120 {
+            let c = if i % 2 == 0 { 100.5 } else { 99.5 };
+            cs.push(candle(i, c, c));
+            i += 1;
+        }
+        let mut price = 99.5;
+        for _ in 0..11 {
+            let o = price;
+            price -= 1.0;
+            cs.push(candle(i, o, price));
+            i += 1;
+        }
+        let plans = generate_signals(&cs, &cfg);
+        let hits: Vec<usize> = plans
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.is_some())
+            .map(|(ix, _)| ix)
+            .collect();
+        assert!(!hits.is_empty(), "expected at least one fade entry");
+        assert!(hits.iter().all(|&h| h >= 120), "fires only during the slide");
+        let p = plans[hits[0]].unwrap();
+        assert!(p.stop < p.entry && p.entry < p.target);
+    }
+
+    #[test]
+    fn zband_vetoes_single_crash_bar() {
+        let mut cfg = zband_cfg();
+        cfg.name = "zband_meanrev".into();
+        cfg.atr_period = 3;
+        let mut cs: Vec<Candle> = Vec::new();
+        for (i, _) in std::iter::repeat(()).take(130).enumerate() {
+            cs.push(candle(i, 100.0, 100.0));
+        }
+        // one catastrophic bar: z hugely negative but ATR spikes past veto
+        cs.push(candle(130, 100.0, 50.0));
+        assert!(generate_signals(&cs, &cfg).iter().all(|p| p.is_none()));
+    }
+
+    #[test]
+    fn zband_quiet_chop_never_fires() {
+        let mut cfg = zband_cfg();
+        cfg.name = "zband_meanrev".into();
+        cfg.atr_period = 3;
+        let mut cs: Vec<Candle> = Vec::new();
+        // alternating ±0.5 around 100: |z| stays well under 2
+        for i in 0..160 {
+            let c = if i % 2 == 0 { 100.5 } else { 99.5 };
+            cs.push(candle(i, c, c));
+        }
+        assert!(generate_signals(&cs, &cfg).iter().all(|p| p.is_none()));
+    }
+
+    #[test]
+    fn zband_warmup_is_none() {
+        let mut cfg = zband_cfg();
+        cfg.name = "zband_meanrev".into();
+        cfg.atr_period = 3;
+        let mut cs: Vec<Candle> = Vec::new();
+        for i in 0..110 {
+            cs.push(candle(i, 100.0, 100.0));
+        }
+        cs.push(candle(110, 100.0, 90.0));
+        let plans = generate_signals(&cs, &cfg);
+        assert!(plans[..106].iter().all(|p| p.is_none()));
+    }
+
+    #[test]
+    fn option_median_even_length_averages_middle() {
+        let v = vec![Some(1.0), Some(3.0), None, Some(5.0), Some(7.0)];
+        assert!(option_median(&v).is_some());
+        // sorted non-None: 1,3,5,7 -> median 4.0
+        assert!((option_median(&v).unwrap() - 4.0).abs() < 1e-9);
+        assert_eq!(option_median(&[None, None]), None);
     }
 }
