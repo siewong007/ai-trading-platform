@@ -196,7 +196,9 @@ pub fn run_with_signals(
                         entry_fee,
                         mfe_r: 0.0,
                         mae_r: 0.0,
-                        bars_held: 1,
+                        // entry bar itself is counted when its iteration
+                        // runs pos_exc below — do not pre-count here
+                        bars_held: 0,
                     });
                 }
             }
