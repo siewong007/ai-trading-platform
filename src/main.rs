@@ -164,10 +164,66 @@ fn main() -> anyhow::Result<()> {
         Command::Report { md } => {
             let db = rt.block_on(Db::open_default())?;
             let ledger = rt.block_on(db.ledger())?;
-            if md {
-                println!("# research ledger");
-                println!("- budget: {}/20", ledger["variant_budget_used"]);
-                println!("- distinct configs: {}", ledger["distinct_hashes"]);
+                        if md {
+                let fam = |r: &serde_json::Value| -> &'static str {
+                    if r.get("entry_window_utc").is_some() {
+                        "session_ema_rsi"
+                    } else if r.get("breakout_lookback_bars").is_some() {
+                        "donchian_vol"
+                    } else if r.get("lookback_bars").is_some()
+                        || r.get("z_entry").is_some()
+                    {
+                        "zband_meanrev"
+                    } else {
+                        "ema_rsi_pullback"
+                    }
+                };
+                let dt = |v: &serde_json::Value| -> String {
+                    match v.as_i64() {
+                        Some(ts) => chrono::DateTime::from_timestamp_millis(ts)
+                            .map(|d| d.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default(),
+                        None => "—".into(),
+                    }
+                };
+                println!("# Research Ledger — {}", chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"));
+                println!(
+                    "budget: {}/20 · configs: {}",
+                    ledger["variant_budget_used"], ledger["distinct_hashes"]
+                );
+                for h in ledger["hashes"].as_array().unwrap() {
+                    let results = h["results"].as_array().unwrap();
+                    let first = results.first().unwrap();
+                    let total: f64 = results
+                        .iter()
+                        .filter_map(|r| r["oos_pnl"].as_f64())
+                        .sum();
+                    println!(
+                        "\n## {} [{}] · {} → {} · net {:+.2}",
+                        &h["hash"].as_str().unwrap()[..8],
+                        fam(first),
+                        dt(&first["oos_start_ts"]),
+                        dt(&results.last().unwrap()["oos_end_ts"]),
+                        total
+                    );
+                    println!(
+                        "{:<9} {:>4} {:>6} {:>9} {:>6}  {}",
+                        "pair", "n", "PF", "PnL", "DD%", "window"
+                    );
+                    for r in results {
+                        let pf = r["oos_pf"].as_f64().unwrap_or(0.0);
+                        println!(
+                            "{:<9} {:>4} {:>6.2} {:>+9.2} {:>6.1}  {} → {}",
+                            r["symbol"].as_str().unwrap_or("?"),
+                            r["oos_trades"],
+                            pf,
+                            r["oos_pnl"].as_f64().unwrap_or(0.0),
+                            r["oos_dd"].as_f64().unwrap_or(0.0),
+                            dt(&r["oos_start_ts"]),
+                            dt(&r["oos_end_ts"]),
+                        );
+                    }
+                }
                 let pfs: Vec<f64> = ledger["hashes"]
                     .as_array()
                     .unwrap()
@@ -178,26 +234,12 @@ fn main() -> anyhow::Result<()> {
                 if let Some(exp) = crate::metrics::luck_adjusted_best_pf(&pfs) {
                     let observed = pfs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                     println!(
-                        "- luck-adjusted best PF by chance ({} trials): {:.2}; observed best: {:.2} {}",
+                        "\nluck-adjusted best PF by chance ({} trials): {:.2}; observed best: {:.2} {}",
                         pfs.len(),
                         exp,
                         observed,
                         if observed > exp { "→ beats luck" } else { "→ within luck" }
                     );
-                }
-                for h in ledger["hashes"].as_array().unwrap() {
-                    let sym: Vec<String> = h["results"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|r| {
-                            format!(
-                                "{} n={} pf={:.2} pnl={:+.2}",
-                                r["symbol"], r["oos_trades"], r["oos_pf"], r["oos_pnl"]
-                            )
-                        })
-                        .collect();
-                    println!("- `{}` — {}", &h["hash"].as_str().unwrap()[..8], sym.join("; "));
                 }
             } else {
                 println!("{ledger}");
