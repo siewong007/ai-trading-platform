@@ -88,6 +88,8 @@ CREATE TABLE IF NOT EXISTS backtest_runs(
   oos_dd REAL NOT NULL,
   lookback_bars INTEGER,
   z_entry REAL,
+  oos_start_ts INTEGER,
+  oos_end_ts INTEGER,
   ran_at INTEGER NOT NULL
 );
 "#;
@@ -103,6 +105,8 @@ impl Db {
         for ddl in [
             "ALTER TABLE backtest_runs ADD COLUMN lookback_bars INTEGER",
             "ALTER TABLE backtest_runs ADD COLUMN z_entry REAL",
+            "ALTER TABLE backtest_runs ADD COLUMN oos_start_ts INTEGER",
+            "ALTER TABLE backtest_runs ADD COLUMN oos_end_ts INTEGER",
         ] {
             if let Err(e) = sqlx::query(ddl).execute(&pool).await {
                 let msg = format!("{e}");
@@ -283,6 +287,8 @@ pub struct BacktestRunRow {
     pub rr: f64,
     pub lookback_bars: Option<i64>,
     pub z_entry: Option<f64>,
+    pub oos_start_ts: Option<i64>,
+    pub oos_end_ts: Option<i64>,
     pub oos_trades: i64,
     pub oos_pf: f64,
     pub oos_pnl: f64,
@@ -322,8 +328,8 @@ impl Db {
                 .await?;
             sqlx::query(
                 "INSERT INTO backtest_runs(config_hash,symbol,rsi_entry,atr_mult,rr,
-                 lookback_bars,z_entry,oos_trades,oos_pf,oos_pnl,oos_dd,ran_at)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                 lookback_bars,z_entry,oos_start_ts,oos_end_ts,oos_trades,oos_pf,oos_pnl,oos_dd,ran_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             )
             .bind(config_hash)
             .bind(&r.symbol)
@@ -332,6 +338,8 @@ impl Db {
             .bind(r.rr)
             .bind(r.lookback_bars)
             .bind(r.z_entry)
+            .bind(r.oos_start_ts)
+            .bind(r.oos_end_ts)
             .bind(r.oos_trades)
             .bind(r.oos_pf)
             .bind(r.oos_pnl)
@@ -477,6 +485,8 @@ mod tests {
             rr: 1.5,
             lookback_bars: None,
             z_entry: None,
+            oos_start_ts: None,
+            oos_end_ts: None,
             oos_trades: 25,
             oos_pf: 1.4,
             oos_pnl: pnl,
@@ -494,6 +504,8 @@ mod tests {
             rr: 1.5,
             lookback_bars: Some(48),
             z_entry: Some(2.0),
+            oos_start_ts: Some(1000),
+            oos_end_ts: Some(2000),
             oos_trades: 21,
             oos_pf: 1.4,
             oos_pnl: 5.0,
@@ -508,6 +520,14 @@ mod tests {
         .unwrap();
         assert_eq!(stored.get::<Option<i64>, _>("lookback_bars"), Some(48));
         assert_eq!(stored.get::<Option<f64>, _>("z_entry"), Some(2.0));
+        let w = sqlx::query(
+            "SELECT oos_start_ts, oos_end_ts FROM backtest_runs WHERE config_hash='zbhash'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(w.get::<Option<i64>, _>("oos_start_ts"), Some(1000));
+        assert_eq!(w.get::<Option<i64>, _>("oos_end_ts"), Some(2000));
     }
 
     async fn scalar(db: &Db, sql: &'static str) -> i64 {
