@@ -130,7 +130,7 @@ pub fn run(candles: &[Candle], strat: &StrategySection, bt: &BacktestSection) ->
 /// permutation studies without re-running indicator math.
 pub fn run_with_signals(
     candles: &[Candle],
-    strat: &StrategySection,
+    _strat: &StrategySection,
     bt: &BacktestSection,
     signals: Vec<Option<crate::strategy::TradePlan>>,
 ) -> BacktestOutput {

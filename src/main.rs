@@ -324,6 +324,7 @@ struct PairResult {
     symbol: String,
     is_metrics: Metrics,
     oos_metrics: Metrics,
+    attribution: Option<crate::backtest::Attribution>,
 }
 
 async fn evaluate_config(
@@ -374,8 +375,10 @@ async fn evaluate_config(
             });
         }
 
+        let attribution = crate::backtest::summarize_attribution(&out.trades);
         results.push(PairResult {
             symbol: pair.clone(),
+            attribution,
             is_metrics,
             oos_metrics,
         });
@@ -419,6 +422,21 @@ fn print_report(results: &[PairResult]) -> GateVerdict {
             r.oos_metrics.max_drawdown_pct,
             r.oos_metrics.net_pnl,
         );
+    }
+    if results.iter().any(|r| r.attribution.is_some()) {
+        println!("\nATTRIBUTION (all simulated trades per pair)");
+        println!(
+            "{:<10} {:>8} {:>8} {:>8} {:>10}",
+            "pair", "avgMFE_R", "avgMAE_R", "medBars", "worst4h"
+        );
+        for r in results {
+            let Some(a) = &r.attribution else { continue };
+            println!(
+                "{:<10} {:>8.2} {:>8.2} {:>8.0} {:>10} ({:+.2})",
+                r.symbol, a.avg_mfe_r, a.avg_mae_r, a.median_bars_held,
+                format!("{}h", a.worst_bucket.0 * 4), a.worst_bucket.1
+            );
+        }
     }
     let verdict = evaluate_gate(&reports);
     println!(
