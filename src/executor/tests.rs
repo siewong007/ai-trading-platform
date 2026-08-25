@@ -21,6 +21,8 @@ fn fixture_cfg() -> (StrategySection, BacktestSection) {
         breakout_lookback_bars: None,
     };
     let bt = BacktestSection {
+        fee_rate: None,
+        slippage: None,
         start_equity_usd: 200.0,
         risk_per_trade_usd: 2.0,
         max_notional_pct_equity: 0.5,

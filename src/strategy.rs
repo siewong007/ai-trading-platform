@@ -36,6 +36,11 @@ pub struct StrategySection {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BacktestSection {
+    /// measurement-only cost overrides; None = frozen spec costs
+    #[serde(default)]
+    pub fee_rate: Option<f64>,
+    #[serde(default)]
+    pub slippage: Option<f64>,
     pub start_equity_usd: f64,
     pub risk_per_trade_usd: f64,
     pub max_notional_pct_equity: f64,
@@ -80,6 +85,14 @@ impl StrategyConfig {
             ("strategy_name".into(), s.name.clone()),
             ("timeframe".into(), s.timeframe.clone()),
         ];
+        // Measurement-only cost overrides join the hash ONLY when set:
+        // unset (None) keeps every legacy/zband/gen-2 hash byte-stable.
+        if let Some(v) = b.fee_rate {
+            fields.push(("fee_rate".into(), fx(v)));
+        }
+        if let Some(v) = b.slippage {
+            fields.push(("slippage".into(), fx(v)));
+        }
         // Family-specific params join the hash ONLY when set (Some): unset
         // (None) must NOT perturb legacy ema_rsi_pullback hashes or the
         // persisted variant-budget accounting would see them as new configs.
@@ -846,6 +859,15 @@ min_notional_usd = 15.0
         assert!(fb[0].label.trim().starts_with("rsi="));
     }
 
+
+    #[test]
+    fn cost_overrides_change_hash_but_defaults_do_not() {
+        let a: StrategyConfig = toml::from_str(HASH_TOML_A).unwrap();
+        assert_eq!(a.backtest.fee_rate, None);
+        let mut m = a.clone();
+        m.backtest.fee_rate = Some(0.00075);
+        assert_ne!(a.config_hash(), m.config_hash());
+    }
 
     #[test]
     fn hour_in_window_inclusive_exclusive_and_wrap() {

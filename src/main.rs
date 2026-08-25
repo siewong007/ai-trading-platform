@@ -52,6 +52,12 @@ enum Command {
         /// temporal fold stability analysis (0 = off)
         #[arg(long, default_value_t = 0)]
         folds: usize,
+        /// measurement-only taker fee override, basis points per side
+        #[arg(long)]
+        fee_bps: Option<f64>,
+        /// measurement-only slippage override, basis points per side
+        #[arg(long)]
+        slip_bps: Option<f64>,
     },
     /// Run the pre-declared variant grid within the 20-config budget
     Search {
@@ -67,6 +73,10 @@ enum Command {
         config: String,
         #[arg(long, default_value_t = 20.0)]
         pct: f64,
+        #[arg(long)]
+        fee_bps: Option<f64>,
+        #[arg(long)]
+        slip_bps: Option<f64>,
     },
 
     /// Permutation significance of a config's simulated PnL
@@ -75,6 +85,10 @@ enum Command {
         config: String,
         #[arg(long, default_value_t = 200)]
         trials: usize,
+        #[arg(long)]
+        fee_bps: Option<f64>,
+        #[arg(long)]
+        slip_bps: Option<f64>,
     },
 
     /// Dump the research ledger (budget, hashes, windows, halts)
@@ -132,11 +146,11 @@ fn main() -> anyhow::Result<()> {
         Command::Fetch { config, interval, lookback_days } => {
             rt.block_on(run_fetch(&config, interval, lookback_days))?
         }
-        Command::Permutetest { config, trials } => {
-            rt.block_on(run_permutetest(&config, trials))?;
+        Command::Permutetest { config, trials, fee_bps, slip_bps } => {
+            rt.block_on(run_permutetest(&config, trials, fee_bps, slip_bps))?;
         }
-        Command::Sensitivity { config, pct } => {
-            rt.block_on(run_sensitivity(&config, pct))?;
+        Command::Sensitivity { config, pct, fee_bps, slip_bps } => {
+            rt.block_on(run_sensitivity(&config, pct, fee_bps, slip_bps))?;
         }
         Command::Report { md } => {
             let db = rt.block_on(Db::open_default())?;
@@ -180,8 +194,8 @@ fn main() -> anyhow::Result<()> {
                 println!("{ledger}");
             }
         }
-        Command::Backtest { config, folds } => {
-            let results = rt.block_on(run_backtest(&config))?;
+        Command::Backtest { config, folds, fee_bps, slip_bps } => {
+            let results = rt.block_on(run_backtest_cfg(&config, fee_bps, slip_bps))?;
             if folds > 0 {
                 print_folds(&results, folds);
             }
@@ -642,8 +656,14 @@ fn aggregate_pnl(candles_by_pair: &[(String, Vec<crate::types::Candle>)],
         .sum()
 }
 
-async fn run_permutetest(config_path: &str, trials: usize) -> anyhow::Result<()> {
-    let cfg = StrategyConfig::load(config_path)?;
+async fn run_permutetest(
+    config_path: &str,
+    trials: usize,
+    fee_bps: Option<f64>,
+    slip_bps: Option<f64>,
+) -> anyhow::Result<()> {
+    let mut cfg = StrategyConfig::load(config_path)?;
+    cfg.backtest = bt_with_costs(&cfg.backtest, fee_bps, slip_bps);
     let db = Db::open_default().await?;
     anyhow::ensure!(trials >= 10, "need at least 10 trials");
     let mut by_pair: Vec<(String, Vec<crate::types::Candle>)> = Vec::new();
@@ -776,8 +796,14 @@ fn apply_param(strat: &mut StrategySection, key: &str, mul: f64) {
     }
 }
 
-async fn run_sensitivity(config_path: &str, pct: f64) -> anyhow::Result<()> {
-    let cfg = StrategyConfig::load(config_path)?;
+async fn run_sensitivity(
+    config_path: &str,
+    pct: f64,
+    fee_bps: Option<f64>,
+    slip_bps: Option<f64>,
+) -> anyhow::Result<()> {
+    let mut cfg = StrategyConfig::load(config_path)?;
+    cfg.backtest = bt_with_costs(&cfg.backtest, fee_bps, slip_bps);
     let db = Db::open_default().await?;
     anyhow::ensure!((0.0..50.0).contains(&pct), "pct must be in [0,50)");
     let params = family_params(&cfg.strategy.name);
@@ -811,8 +837,30 @@ async fn run_sensitivity(config_path: &str, pct: f64) -> anyhow::Result<()> {
     Ok(())
 }
 
+
+fn bt_with_costs(base: &BacktestSection, fee_bps: Option<f64>, slip_bps: Option<f64>)
+    -> BacktestSection {
+    let mut bt = base.clone();
+    if let Some(f) = fee_bps {
+        bt.fee_rate = Some(f / 10_000.0);
+    }
+    if let Some(sl) = slip_bps {
+        bt.slippage = Some(sl / 10_000.0);
+    }
+    bt
+}
+
 async fn run_backtest(config_path: &str) -> anyhow::Result<Vec<PairResult>> {
-    let cfg = StrategyConfig::load(config_path)?;
+    run_backtest_cfg(config_path, None, None).await
+}
+
+async fn run_backtest_cfg(
+    config_path: &str,
+    fee_bps: Option<f64>,
+    slip_bps: Option<f64>,
+) -> anyhow::Result<Vec<PairResult>> {
+    let mut cfg = StrategyConfig::load(config_path)?;
+    cfg.backtest = bt_with_costs(&cfg.backtest, fee_bps, slip_bps);
     let db = Db::open_default().await?;
     let results = evaluate_config(&db, &cfg.strategy, &cfg.backtest, None).await?;
     print_report(&results);

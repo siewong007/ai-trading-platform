@@ -129,6 +129,15 @@ pub fn run(candles: &[Candle], strat: &StrategySection, bt: &BacktestSection) ->
     run_with_signals(candles, strat, bt, signals)
 }
 
+impl BacktestSection {
+    pub fn eff_fee(&self) -> f64 {
+        self.fee_rate.unwrap_or(TAKER_FEE_RATE)
+    }
+    pub fn eff_slip(&self) -> f64 {
+        self.slippage.unwrap_or(SLIPPAGE_RATE)
+    }
+}
+
 /// Same simulation with caller-supplied signals — enables attribution and
 /// permutation studies without re-running indicator math.
 pub fn run_with_signals(
@@ -153,15 +162,16 @@ pub fn run_with_signals(
                 pos_exc(&mut p, r);
             }
             // exit checks on this candle (entry bar included -> gap handling)
+            let slip = bt.eff_slip();
             let exit: Option<(f64, ExitReason)> = if c.low <= p.stop {
-                Some((p.stop * (1.0 - SLIPPAGE_RATE), ExitReason::Stop))
+                Some((p.stop * (1.0 - slip), ExitReason::Stop))
             } else if c.high >= p.target {
-                Some((p.target * (1.0 - SLIPPAGE_RATE), ExitReason::Target))
+                Some((p.target * (1.0 - slip), ExitReason::Target))
             } else {
                 None
             };
             if let Some((exit_price, reason)) = exit {
-                let exit_fee = exit_price * p.qty * TAKER_FEE_RATE;
+                let exit_fee = exit_price * p.qty * bt.eff_fee();
                 let pnl = (exit_price - p.entry_price) * p.qty - p.entry_fee - exit_fee;
                 equity += pnl;
                 trades.push(TradeRecord {
@@ -187,9 +197,9 @@ pub fn run_with_signals(
         // new entry: signal on THIS candle close fills at NEXT candle open
         if pos.is_none() && i + 1 < candles.len() {
             if let Some(plan) = signals[i] {
-                let fill = candles[i + 1].open * (1.0 + SLIPPAGE_RATE);
+                let fill = candles[i + 1].open * (1.0 + bt.eff_slip());
                 if let Some(qty) = position_sizing(fill, plan.stop, equity, bt) {
-                    let entry_fee = fill * qty * TAKER_FEE_RATE;
+                    let entry_fee = fill * qty * bt.eff_fee();
                     pos = Some(Position {
                         qty,
                         entry_price: fill,
@@ -287,6 +297,8 @@ mod tests {
             breakout_lookback_bars: None,
         };
         let bt = BacktestSection {
+            fee_rate: None,
+            slippage: None,
             start_equity_usd: 10_000.0,
             risk_per_trade_usd: 100.0,
             max_notional_pct_equity: 0.9,
@@ -340,6 +352,8 @@ mod tests {
         // never re-hardcoded here
         let cfg = StrategyConfig::load_from_toml_str(CFG_TOML).unwrap();
         BacktestSection {
+            fee_rate: None,
+            slippage: None,
             start_equity_usd: equity,
             risk_per_trade_usd: risk,
             max_notional_pct_equity: cfg.backtest.max_notional_pct_equity,
