@@ -38,6 +38,9 @@ enum Command {
     Fetch {
         #[arg(long, default_value = "config/strategy_ema_rsi.toml")]
         config: String,
+        /// override the strategy timeframe for this cache (e.g. 15m, 4h)
+        #[arg(long)]
+        interval: Option<String>,
     },
     /// Backtest one strategy config; print IS/OOS report + gate verdict
     Backtest {
@@ -123,7 +126,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let rt = tokio::runtime::Runtime::new()?;
     match cli.command {
-        Command::Fetch { config } => rt.block_on(run_fetch(&config))?,
+        Command::Fetch { config, interval } => rt.block_on(run_fetch(&config, interval))?,
         Command::Permutetest { config, trials } => {
             rt.block_on(run_permutetest(&config, trials))?;
         }
@@ -368,21 +371,23 @@ async fn run_flatten(config_path: &str, base: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_fetch(config_path: &str) -> anyhow::Result<()> {
+async fn run_fetch(
+    config_path: &str,
+    interval: Option<String>,
+) -> anyhow::Result<()> {
     let cfg = StrategyConfig::load(config_path)?;
+    let tf = interval.unwrap_or_else(|| cfg.strategy.timeframe.clone());
     let db = Db::open_default().await?;
     let ex = Exchange::new(BINANCE_BASE)?;
     let start = chrono::Utc::now().timestamp_millis() - LOOKBACK_DAYS * 86_400_000;
     for pair in &cfg.strategy.pairs {
-        let ks = ex
-            .fetch_klines(pair, &cfg.strategy.timeframe, start)
-            .await?;
+        let ks = ex.fetch_klines(pair, &tf, start).await?;
         let span_days = if ks.len() > 1 {
             (ks.last().unwrap().open_time - ks.first().unwrap().open_time) / 86_400_000
         } else {
             0
         };
-        db.upsert_klines(pair, &cfg.strategy.timeframe, &ks).await?;
+        db.upsert_klines(pair, &tf, &ks).await?
         tracing::info!("{pair}: cached {} candles (~{span_days} days)", ks.len());
     }
     Ok(())

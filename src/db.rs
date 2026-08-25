@@ -551,6 +551,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn klines_are_isolated_per_interval() {
+        let db = Db::open("sqlite::memory:").await.unwrap();
+        let mk = |ot: i64| crate::types::Candle {
+            open_time: ot,
+            open: 1.0, high: 2.0, low: 0.5, close: 1.5, volume: 9.0,
+        };
+        db.upsert_klines("T", "1h", &[mk(1000), mk(2000)]).await.unwrap();
+        db.upsert_klines("T", "15m", &[mk(1500)]).await.unwrap();
+        let h = db.load_klines("T", "1h").await.unwrap();
+        let m = db.load_klines("T", "15m").await.unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].open_time, 1500);
+    }
+
+    #[tokio::test]
     async fn band_columns_round_trip() {
         let db = Db::open("sqlite::memory:").await.unwrap();
         let rows = vec![BacktestRunRow {
