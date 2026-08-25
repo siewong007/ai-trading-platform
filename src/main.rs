@@ -43,6 +43,9 @@ enum Command {
     Backtest {
         #[arg(long, default_value = "config/strategy_ema_rsi.toml")]
         config: String,
+        /// temporal fold stability analysis (0 = off)
+        #[arg(long, default_value_t = 0)]
+        folds: usize,
     },
     /// Run the pre-declared variant grid within the 20-config budget
     Search {
@@ -98,7 +101,12 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     match cli.command {
         Command::Fetch { config } => rt.block_on(run_fetch(&config))?,
-        Command::Backtest { config } => rt.block_on(run_backtest(&config))?,
+        Command::Backtest { config, folds } => {
+            let results = rt.block_on(run_backtest(&config))?;
+            if folds > 0 {
+                print_folds(&results, folds);
+            }
+        }
         Command::Search {
             config,
             unlock_new_study,
@@ -325,6 +333,7 @@ struct PairResult {
     is_metrics: Metrics,
     oos_metrics: Metrics,
     attribution: Option<crate::backtest::Attribution>,
+    oos_trades: Vec<crate::backtest::TradeRecord>,
 }
 
 async fn evaluate_config(
@@ -379,6 +388,7 @@ async fn evaluate_config(
         results.push(PairResult {
             symbol: pair.clone(),
             attribution,
+            oos_trades: oos_trades.clone(),
             is_metrics,
             oos_metrics,
         });
@@ -452,12 +462,54 @@ fn print_report(results: &[PairResult]) -> GateVerdict {
     verdict
 }
 
-async fn run_backtest(config_path: &str) -> anyhow::Result<()> {
+
+/// K equal consecutive [start,end) windows covering [start, end].
+pub fn fold_bounds(start: i64, end: i64, k: usize) -> Vec<(i64, i64)> {
+    if k == 0 || end <= start {
+        return vec![];
+    }
+    let w = (end - start) / k as i64;
+    (0..k)
+        .map(|i| {
+            let a = start + (i as i64) * w;
+            let b = if i == k - 1 { end } else { a + w };
+            (a, b)
+        })
+        .collect()
+}
+
+fn print_folds(results: &[PairResult], folds: usize) {
+    println!("\nFOLD STABILITY (K={folds}, consecutive OOS windows)");
+    for r in results {
+        if r.oos_trades.is_empty() {
+            continue;
+        }
+        let start = r.oos_trades.iter().map(|t| t.entry_ts).min().unwrap();
+        let end = r.oos_trades.iter().map(|t| t.exit_ts).max().unwrap();
+        let bounds = fold_bounds(start, end, folds);
+        let cells: Vec<String> = bounds
+            .iter()
+            .map(|(a, b)| {
+                let seg: Vec<_> = r
+                    .oos_trades
+                    .iter()
+                    .filter(|t| t.entry_ts >= *a && t.entry_ts < *b)
+                    .collect();
+                let pnl: f64 = seg.iter().map(|t| t.pnl).sum();
+                format!("{:>2}:{:+7.2}", seg.len(), pnl)
+            })
+            .collect();
+        println!("{:<10} {}", r.symbol, cells.join("  "));
+    }
+    println!("RANKING IS ANALYSIS ONLY — fold spread is a robustness signal, not a gate input.");
+}
+
+async fn run_backtest(config_path: &str) -> anyhow::Result<Vec<PairResult>> {
     let cfg = StrategyConfig::load(config_path)?;
     let db = Db::open_default().await?;
     let results = evaluate_config(&db, &cfg.strategy, &cfg.backtest, None).await?;
     print_report(&results);
-    Ok(())
+    Ok(results)
 }
 
 fn confirm_new_study_input(input: &str) -> bool {
@@ -688,6 +740,16 @@ async fn run_export(out: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fold_bounds_partitions_evenly_and_covers_span() {
+        let b = super::fold_bounds(0, 300, 3);
+        assert_eq!(b, vec![(0, 100), (100, 200), (200, 300)]);
+        // remainder lands in the last window (width uses integer division)
+        let b2 = super::fold_bounds(0, 310, 3);
+        assert_eq!(b2, vec![(0, 103), (103, 206), (206, 310)]);
+        assert_eq!(super::fold_bounds(5, 5, 3), vec![]);
+    }
 
     #[test]
     fn zband_grid_matches_frozen_spec_exactly() {
