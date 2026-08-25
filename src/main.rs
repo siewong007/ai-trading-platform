@@ -41,6 +41,9 @@ enum Command {
         /// override the strategy timeframe for this cache (e.g. 15m, 4h)
         #[arg(long)]
         interval: Option<String>,
+        /// override lookback depth in days (default 550; deep research: 2200)
+        #[arg(long)]
+        lookback_days: Option<i64>,
     },
     /// Backtest one strategy config; print IS/OOS report + gate verdict
     Backtest {
@@ -126,7 +129,9 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let rt = tokio::runtime::Runtime::new()?;
     match cli.command {
-        Command::Fetch { config, interval } => rt.block_on(run_fetch(&config, interval))?,
+        Command::Fetch { config, interval, lookback_days } => {
+            rt.block_on(run_fetch(&config, interval, lookback_days))?
+        }
         Command::Permutetest { config, trials } => {
             rt.block_on(run_permutetest(&config, trials))?;
         }
@@ -374,12 +379,14 @@ async fn run_flatten(config_path: &str, base: &str) -> anyhow::Result<()> {
 async fn run_fetch(
     config_path: &str,
     interval: Option<String>,
+    lookback_days: Option<i64>,
 ) -> anyhow::Result<()> {
+    let days = lookback_days.unwrap_or(LOOKBACK_DAYS);
     let cfg = StrategyConfig::load(config_path)?;
     let tf = interval.unwrap_or_else(|| cfg.strategy.timeframe.clone());
     let db = Db::open_default().await?;
     let ex = Exchange::new(BINANCE_BASE)?;
-    let start = chrono::Utc::now().timestamp_millis() - LOOKBACK_DAYS * 86_400_000;
+    let start = chrono::Utc::now().timestamp_millis() - days * 86_400_000;
     for pair in &cfg.strategy.pairs {
         let ks = ex.fetch_klines(pair, &tf, start).await?;
         let span_days = if ks.len() > 1 {
@@ -523,6 +530,21 @@ fn print_report(results: &[PairResult]) -> GateVerdict {
                 format!("{}h", a.worst_bucket.0 * 4), a.worst_bucket.1
             );
         }
+        // session-conditioned aggregate: pnl by 4h UTC bucket across pairs
+        let mut agg = [0.0f64; 6];
+        for r in results {
+            if let Some(a) = &r.attribution {
+                for i in 0..6 {
+                    agg[i] += a.buckets[i];
+                }
+            }
+        }
+        let cells: Vec<String> = agg
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("{:>2}h {:+8.2}", i * 4, v))
+            .collect();
+        println!("PnL by 4h UTC bucket: {}", cells.join(" | "));
     }
     let verdict = evaluate_gate(&reports);
     println!(

@@ -33,6 +33,8 @@ pub struct Attribution {
     pub median_bars_held: f64,
     /// 4h UTC bucket (0..=5) with the lowest summed pnl, and its sum
     pub worst_bucket: (u8, f64),
+    /// summed pnl by 4h UTC bucket (session-conditioned lead hunting)
+    pub buckets: [f64; 6],
 }
 
 /// Summarize attribution over simulated trades; None when empty.
@@ -61,6 +63,7 @@ pub fn summarize_attribution(trades: &[TradeRecord]) -> Option<Attribution> {
         avg_mae_r,
         median_bars_held,
         worst_bucket: (bi as u8, *bv),
+        buckets,
     })
 }
 
