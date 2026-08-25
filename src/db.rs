@@ -240,6 +240,62 @@ impl Db {
         Ok(row.get::<i64, _>("n") as u32)
     }
 
+    /// Full research ledger: budget counter, every known config hash with
+    /// its per-symbol OOS results incl. window bounds, and halt day-state.
+    pub async fn ledger(&self) -> anyhow::Result<serde_json::Value> {
+        let budget = self
+            .config_get("variant_budget_used")
+            .await?
+            .unwrap_or_else(|| "0".into());
+        let rows = sqlx::query(
+            "SELECT config_hash,symbol,rsi_entry,atr_mult,rr,lookback_bars,z_entry,\
+             oos_start_ts,oos_end_ts,oos_trades,oos_pf,oos_pnl,oos_dd,ran_at\
+             FROM backtest_runs ORDER BY config_hash,symbol",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        use std::collections::BTreeMap;
+        let mut by_hash: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+        let mut seen: BTreeMap<String, i64> = BTreeMap::new();
+        for r in &rows {
+            let h: String = r.get("config_hash");
+            *seen.entry(h.clone()).or_default() = r.get::<i64, _>("ran_at");
+            by_hash.entry(h).or_default().push(serde_json::json!({
+                "symbol": r.get::<String,_>("symbol"),
+                "oos_trades": r.get::<i64,_>("oos_trades"),
+                "oos_pf": r.get::<f64,_>("oos_pf"),
+                "oos_pnl": r.get::<f64,_>("oos_pnl"),
+                "oos_dd": r.get::<f64,_>("oos_dd"),
+                "lookback_bars": r.try_get::<Option<i64>,_>("lookback_bars").ok().flatten(),
+                "z_entry": r.try_get::<Option<f64>,_>("z_entry").ok().flatten(),
+                "oos_start_ts": r.try_get::<Option<i64>,_>("oos_start_ts").ok().flatten(),
+                "oos_end_ts": r.try_get::<Option<i64>,_>("oos_end_ts").ok().flatten(),
+            }));
+        }
+        let hashes: Vec<serde_json::Value> = by_hash
+            .into_iter()
+            .map(|(h, results)| {
+                serde_json::json!({
+                    "hash": h,
+                    "last_ran_at": seen[&h],
+                    "results": results,
+                })
+            })
+            .collect();
+        let mut halts = serde_json::Map::new();
+        for k in ["day_state_halted", "day_state_halt_reason"] {
+            if let Some(v) = self.config_get(k).await? {
+                halts.insert(k.to_string(), serde_json::Value::String(v));
+            }
+        }
+        Ok(serde_json::json!({
+            "variant_budget_used": budget.parse::<u32>().unwrap_or(0),
+            "distinct_hashes": hashes.len(),
+            "hashes": hashes,
+            "halts": halts,
+        }))
+    }
+
     /// Overall gate verdict of the most recently recorded backtest_runs
     /// config (spec §5 thresholds recomputed from the stored OOS metrics);
     /// None when nothing is on record.

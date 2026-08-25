@@ -55,6 +55,13 @@ enum Command {
         #[arg(long)]
         unlock_new_study: bool,
     },
+    /// Dump the research ledger (budget, hashes, windows, halts)
+    Report {
+        /// emit human-readable markdown instead of JSON
+        #[arg(long, default_value_t = false)]
+        md: bool,
+    },
+
     /// Export trades table to CSV (tax records)
     Export {
         #[arg(long, default_value = "data/trades_export.csv")]
@@ -101,6 +108,31 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     match cli.command {
         Command::Fetch { config } => rt.block_on(run_fetch(&config))?,
+        Command::Report { md } => {
+            let db = rt.block_on(Db::open_default())?;
+            let ledger = rt.block_on(db.ledger())?;
+            if md {
+                println!("# research ledger");
+                println!("- budget: {}/20", ledger["variant_budget_used"]);
+                println!("- distinct configs: {}", ledger["distinct_hashes"]);
+                for h in ledger["hashes"].as_array().unwrap() {
+                    let sym: Vec<String> = h["results"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|r| {
+                            format!(
+                                "{} n={} pf={:.2} pnl={:+.2}",
+                                r["symbol"], r["oos_trades"], r["oos_pf"], r["oos_pnl"]
+                            )
+                        })
+                        .collect();
+                    println!("- `{}` — {}", &h["hash"].as_str().unwrap()[..8], sym.join("; "));
+                }
+            } else {
+                println!("{ledger}");
+            }
+        }
         Command::Backtest { config, folds } => {
             let results = rt.block_on(run_backtest(&config))?;
             if folds > 0 {
