@@ -73,12 +73,16 @@ impl StrategyConfig {
             ("start_equity_usd".into(), fx(b.start_equity_usd)),
             ("strategy_name".into(), s.name.clone()),
             ("timeframe".into(), s.timeframe.clone()),
-            (
-                "lookback_bars".into(),
-                s.lookback_bars.map(|v| v.to_string()).unwrap_or_default(),
-            ),
-            ("z_entry".into(), s.z_entry.map(fx).unwrap_or_default()),
         ];
+        // Family-specific params join the hash ONLY when set (Some): unset
+        // (None) must NOT perturb legacy ema_rsi_pullback hashes or the
+        // persisted variant-budget accounting would see them as new configs.
+        if let Some(v) = s.lookback_bars {
+            fields.push(("lookback_bars".into(), v.to_string()));
+        }
+        if let Some(v) = s.z_entry {
+            fields.push(("z_entry".into(), fx(v)));
+        }
         fields.sort(); // canonical ordering independent of TOML key order
         let mut h = std::collections::hash_map::DefaultHasher::new();
         for (k, v) in &fields {

@@ -483,16 +483,44 @@ fn check_variant_budget(
     Ok(())
 }
 
+/// Frozen 2026-08-25 (spec §Pre-declared grid): 6 of the 8 reserved slots.
+/// Never edited after seeing any result.
+fn zband_grid() -> [(usize, f64); 6] {
+    [
+        (24, 2.0),
+        (24, 2.5),
+        (48, 2.0),
+        (48, 2.5),
+        (96, 2.0),
+        (96, 2.5),
+    ]
+}
+
 async fn run_search(config_path: &str, unlock_new_study: bool) -> anyhow::Result<()> {
     let base = StrategyConfig::load(config_path)?;
     let db = Db::open_default().await?;
 
-    // Pre-declared grid: 2 x 3 x 2 = 12 variants (spec: ≤ 20 distinct ever)
-    let mut variants: Vec<(f64, f64, f64)> = Vec::new(); // (rsi_entry, atr_mult, rr)
-    for rsi_e in [30.0, 35.0] {
-        for atr_m in [1.5, 2.0, 2.5] {
-            for rr in [1.5, 2.0] {
-                variants.push((rsi_e, atr_m, rr));
+    // Pre-declared grids per family (spec: ≤ 20 distinct configs EVER).
+    // zband grid is FROZEN 2026-08-25 — never edited after seeing results.
+    let mut jobs: Vec<(String, StrategySection)> = Vec::new();
+    if base.strategy.name == "zband_meanrev" {
+        for (lb, z) in zband_grid() {
+            let mut s = base.strategy.clone();
+            s.lookback_bars = Some(lb);
+            s.z_entry = Some(z);
+            jobs.push((format!("lb={lb:>3} z={z}"), s));
+        }
+    } else {
+        // legacy ema_rsi_pullback grid: 2 x 3 x 2 = 12 variants (spec)
+        for rsi_e in [30.0, 35.0] {
+            for atr_m in [1.5, 2.0, 2.5] {
+                for rr in [1.5, 2.0] {
+                    let mut s = base.strategy.clone();
+                    s.rsi_entry_threshold = rsi_e;
+                    s.atr_multiplier = atr_m;
+                    s.risk_reward_ratio = rr;
+                    jobs.push((format!("rsi={rsi_e:>4} atr={atr_m:>3} rr={rr:>3}"), s));
+                }
             }
         }
     }
@@ -514,9 +542,7 @@ async fn run_search(config_path: &str, unlock_new_study: bool) -> anyhow::Result
 
     #[allow(dead_code)] // reported fields kept for ranked output
     struct Row {
-        rsi: f64,
-        atr: f64,
-        rr: f64,
+        label: String,
         pairs_passing_floor: usize,
         profitable_pairs: usize,
         worst_pf: f64,
@@ -525,11 +551,7 @@ async fn run_search(config_path: &str, unlock_new_study: bool) -> anyhow::Result
     }
     let mut rows: Vec<Row> = Vec::new();
 
-    for (rsi_e, atr_m, rr) in variants {
-        let mut strat = base.strategy.clone();
-        strat.rsi_entry_threshold = rsi_e;
-        strat.atr_multiplier = atr_m;
-        strat.risk_reward_ratio = rr;
+    for (label, strat) in jobs {
         let hash = StrategyConfig {
             strategy: strat.clone(),
             backtest: base.backtest.clone(),
@@ -562,17 +584,14 @@ async fn run_search(config_path: &str, unlock_new_study: bool) -> anyhow::Result
             .fold(f64::INFINITY, f64::min);
 
         println!(
-            "rsi={rsi_e:>4} atr={atr_m:>3} rr={rr:>3} | floor:{} prof:{profitable} worstPF:{:.2} trades:{} budget:{used}/{GATE_MAX_VARIANTS} | {}",
-            passing_floor,
+            "{label} | floor:{passing_floor} prof:{profitable} worstPF:{:.2} trades:{} budget:{used}/{GATE_MAX_VARIANTS} | {}",
             if worst_pf.is_infinite() { f64::NAN } else { worst_pf },
             reports.iter().map(|r| r.metrics.total_trades).sum::<usize>(),
             if verdict.pass { "PASS" } else { "fail" },
         );
 
         rows.push(Row {
-            rsi: rsi_e,
-            atr: atr_m,
-            rr,
+            label,
             pairs_passing_floor: passing_floor,
             profitable_pairs: profitable,
             worst_pf,
@@ -587,10 +606,8 @@ async fn run_search(config_path: &str, unlock_new_study: bool) -> anyhow::Result
     println!("The pre-registered gate verdict is the sole go/no-go authority.");
     if let Some(best) = rows.first() {
         println!(
-            "best: rsi={} atr={} rr={} (worstPF {:.2}, {} profitable pairs)",
-            best.rsi,
-            best.atr,
-            best.rr,
+            "best: {} (worstPF {:.2}, {} profitable pairs)",
+            best.label,
             if best.worst_pf.is_infinite() {
                 f64::NAN
             } else {
@@ -651,6 +668,15 @@ async fn run_export(out: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zband_grid_matches_frozen_spec_exactly() {
+        let g = zband_grid();
+        assert_eq!(
+            g,
+            [(24, 2.0), (24, 2.5), (48, 2.0), (48, 2.5), (96, 2.0), (96, 2.5)]
+        );
+    }
 
     #[test]
     fn variant_budget_lock_refuses_new_hash_without_unlock() {
