@@ -20,7 +20,7 @@ internal disk. After any config change: copy TOML into
 
 | Label | Cadence | Job |
 |---|---|---|
-| com.tradingplatform.trade | continuous (KeepAlive) | testnet executor loop; reconciles on every start |
+| com.tradingplatform.trade | continuous (KeepAlive) | testnet executor loop; reconciles on every start; currently paper-trades the gen-2 forward candidate `session_ema_rsi` (00–08h window), corroborating the OOS scoreboard with real order-path fills |
 | com.tradingplatform.fetch | 30 min | refresh klines in **engine** DB — REQUIRED: the executor only *reads* candles; without freshness `is_stale` refuses to act |
 | com.tradingplatform.dashboard | 60 s | render `~/trading-engine/dashboard.html` (self-contained HTML, auto-refreshing tab) |
 | com.tradingplatform.tgbot | long-poll (KeepAlive) | Telegram reporter + entry/fill alert watcher (~60 s latency) |
