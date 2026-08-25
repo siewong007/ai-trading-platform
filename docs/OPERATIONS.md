@@ -24,7 +24,16 @@ internal disk. After any config change: copy TOML into
 | com.tradingplatform.fetch | 30 min | refresh klines in **engine** DB — REQUIRED: the executor only *reads* candles; without freshness `is_stale` refuses to act |
 | com.tradingplatform.dashboard | 60 s | render `~/trading-engine/dashboard.html` (self-contained HTML, auto-refreshing tab) |
 | com.tradingplatform.tgbot | long-poll (KeepAlive) | Telegram reporter + entry/fill alert watcher (~60 s latency) |
-| com.tradingplatform.research | 6 h | measurement suite on both families → `research_history.log`; Telegram push only on change (verdict / p-value fingerprint) |
+| com.tradingplatform.research | 6 h | measurement suite on all four families → `research_history.log`; Telegram push only on change (verdict / p-value fingerprint) |
+| com.tradingplatform.oos | daily | live out-of-sample scoreboard for the frozen `session_ema_rsi` grid over the disjoint window (≥ 2026-08-26); kline-gap scan; weekly permutation refresh (`~/trading-engine/oos_scoreboard.json`) |
+
+**Deploying code changes:** `~/trading-engine/deploy.sh` rebuilds the
+release binary, syncs all family TOMLs into the engine dir, and kickstarts
+the fetch/executor services.
+
+**Reporter extras:** 🌅 08:00 UTC morning digest · 🔴 crash-loop detector
+(≥4 executor restarts in 10 min) · 🟢 entry / ✅❌ fill alerts (~60 s
+latency) · `/clear` sweeps the bot's recent messages (48 h Telegram limit).
 
 Control: `launchctl bootstrap|bootout gui/$(id -u)/<label>`.
 Logs: `/tmp/tp_<name>.{log,err}`.
