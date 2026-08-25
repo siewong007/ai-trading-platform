@@ -1,0 +1,21 @@
+# donchian_vol — breakout continuation with vol-spike veto
+# (gen-2 spec: docs/superpowers/specs/2026-08-25-research-gen2-design.md)
+# Grid varies ONLY breakout_lookback_bars: {72,120,168} frozen.
+[strategy]
+name = "donchian_vol"
+pairs = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+timeframe = "1h"
+breakout_lookback_bars = 120
+ema_fast = 50
+ema_slow = 200
+rsi_period = 14
+rsi_entry_threshold = 35.0
+atr_period = 14
+atr_multiplier = 2.0
+risk_reward_ratio = 1.5
+
+[backtest]
+start_equity_usd = 200.0
+risk_per_trade_usd = 2.0
+max_notional_pct_equity = 0.5
+min_notional_usd = 15.0

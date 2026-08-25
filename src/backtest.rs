@@ -283,6 +283,8 @@ mod tests {
             risk_reward_ratio: 1.5,
             lookback_bars: None,
             z_entry: None,
+            entry_window_utc: None,
+            breakout_lookback_bars: None,
         };
         let bt = BacktestSection {
             start_equity_usd: 10_000.0,
@@ -328,6 +330,8 @@ mod tests {
             risk_reward_ratio: 1.5,
             lookback_bars: None,
             z_entry: None,
+            entry_window_utc: None,
+            breakout_lookback_bars: None,
         }
     }
 

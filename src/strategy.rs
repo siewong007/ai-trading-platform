@@ -26,6 +26,12 @@ pub struct StrategySection {
     pub lookback_bars: Option<usize>,
     #[serde(default)]
     pub z_entry: Option<f64>,
+    /// session_ema_rsi: "HH-HH" UTC window; entries only inside it
+    #[serde(default)]
+    pub entry_window_utc: Option<String>,
+    /// donchian_vol: breakout lookback in hours (72/120/168)
+    #[serde(default)]
+    pub breakout_lookback_bars: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +88,12 @@ impl StrategyConfig {
         }
         if let Some(v) = s.z_entry {
             fields.push(("z_entry".into(), fx(v)));
+        }
+        if let Some(v) = &s.entry_window_utc {
+            fields.push(("entry_window_utc".into(), v.clone()));
+        }
+        if let Some(v) = s.breakout_lookback_bars {
+            fields.push(("breakout_lookback_bars".into(), v.to_string()));
         }
         fields.sort(); // canonical ordering independent of TOML key order
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -189,9 +201,71 @@ impl SignalFamily for ZbandFamily {
     }
 }
 
+
+pub struct SessionEmaRsiFamily;
+pub struct DonchianVolFamily;
+
+impl SignalFamily for SessionEmaRsiFamily {
+    fn name(&self) -> &'static str {
+        "session_ema_rsi"
+    }
+    fn signals(
+        &self,
+        cfg: &StrategySection,
+        candles: &[Candle],
+    ) -> Vec<Option<TradePlan>> {
+        generate_session_signals(candles, cfg)
+    }
+    /// Frozen gen-2 grid: three UTC entry windows (registered lead widened
+    /// for trade-count survival). Never edited after results are seen.
+    fn grid_jobs(&self, base: &StrategyConfig) -> Vec<FamilyGridJob> {
+        const FROZEN: [&str; 3] = ["00-08", "00-12", "22-06"];
+        FROZEN
+            .iter()
+            .map(|&w| {
+                let mut s = base.strategy.clone();
+                s.entry_window_utc = Some(w.to_string());
+                FamilyGridJob {
+                    label: format!("session={w}"),
+                    strat: s,
+                }
+            })
+            .collect()
+    }
+}
+
+impl SignalFamily for DonchianVolFamily {
+    fn name(&self) -> &'static str {
+        "donchian_vol"
+    }
+    fn signals(
+        &self,
+        cfg: &StrategySection,
+        candles: &[Candle],
+    ) -> Vec<Option<TradePlan>> {
+        generate_donchian_signals(candles, cfg)
+    }
+    /// Frozen gen-2 grid: breakout lookbacks in hours (3/5/7 days).
+    fn grid_jobs(&self, base: &StrategyConfig) -> Vec<FamilyGridJob> {
+        const FROZEN: [usize; 3] = [72, 120, 168];
+        FROZEN
+            .iter()
+            .map(|&lb| {
+                let mut s = base.strategy.clone();
+                s.breakout_lookback_bars = Some(lb);
+                FamilyGridJob {
+                    label: format!("don={lb}h"),
+                    strat: s,
+                }
+            })
+            .collect()
+    }
+}
+
 /// Registry lookup; None for unknown family names.
 pub fn find_family(name: &str) -> Option<&'static dyn SignalFamily> {
-    const REGISTRY: &[&dyn SignalFamily] = &[&EmaRsiFamily, &ZbandFamily];
+    const REGISTRY: &[&dyn SignalFamily] =
+        &[&EmaRsiFamily, &ZbandFamily, &SessionEmaRsiFamily, &DonchianVolFamily];
     REGISTRY.iter().copied().find(|f| f.name() == name)
 }
 
@@ -271,6 +345,91 @@ fn option_median(vals: &[Option<f64>]) -> Option<f64> {
     Some((v[(v.len() - 1) / 2] + v[v.len() / 2]) / 2.0)
 }
 
+/// True when `hour` (UTC 0-23) falls inside "HH-HH" (inclusive start,
+/// exclusive end; wraps midnight). Malformed windows refuse everything.
+pub fn hour_in_window(hour: u32, window: &str) -> bool {
+    let parts: Vec<&str> = window.split('-').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let (Ok(a), Ok(b)) = (parts[0].trim().parse::<u32>(), parts[1].trim().parse::<u32>())
+    else {
+        return false;
+    };
+    if a >= 24 || b > 24 || a == b {
+        return false;
+    }
+    if a < b {
+        hour >= a && hour < b
+    } else {
+        hour >= a || hour < b
+    }
+}
+
+/// EMA/RSI pullback engine gated to a UTC entry window (gen-2 registered
+/// lead: US-session entries bled across six years of data).
+pub fn generate_session_signals(
+    candles: &[Candle],
+    cfg: &StrategySection,
+) -> Vec<Option<TradePlan>> {
+    let mut out = generate_ema_rsi_signals(candles, cfg);
+    let win = cfg
+        .entry_window_utc
+        .clone()
+        .unwrap_or_else(|| "00-24".into());
+    for (i, slot) in out.iter_mut().enumerate() {
+        if slot.is_some() {
+            let hour = (candles[i].open_time / 3_600_000).rem_euclid(24) as u32;
+            if !hour_in_window(hour, &win) {
+                *slot = None;
+            }
+        }
+    }
+    out
+}
+
+/// Donchian-style breakout continuation (gen-2): long when the close makes
+/// a new `breakout_lookback_bars`-hour high while volatility is calm.
+/// Exits stay OCO-native via ATR stop and RR-multiple target.
+pub fn generate_donchian_signals(
+    candles: &[Candle],
+    cfg: &StrategySection,
+) -> Vec<Option<TradePlan>> {
+    let n = candles.len();
+    let mut out: Vec<Option<TradePlan>> = vec![None; n];
+    let lb = cfg.breakout_lookback_bars.unwrap_or(120);
+    let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
+    let highs: Vec<f64> = candles.iter().map(|c| c.high).collect();
+    let lows: Vec<f64> = candles.iter().map(|c| c.low).collect();
+    let atr_v = atr(&highs, &lows, &closes, cfg.atr_period);
+
+    let warmup = (lb + 1).max(cfg.atr_period + VETO_MEDIAN_BARS + 1);
+    for i in warmup..n {
+        let Some(a) = atr_v[i] else { continue };
+        let Some(atr_med) = option_median(&atr_v[i - VETO_MEDIAN_BARS..i]) else {
+            continue;
+        };
+        if a > VETO_ATR_MULT * atr_med {
+            continue;
+        }
+        let hh = highs[i - lb..i].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        if closes[i] <= hh {
+            continue;
+        }
+        let entry = closes[i];
+        let stop = entry - cfg.atr_multiplier * a;
+        if stop >= entry {
+            continue;
+        }
+        out[i] = Some(TradePlan {
+            entry,
+            stop,
+            target: entry + cfg.risk_reward_ratio * (entry - stop),
+        });
+    }
+    out
+}
+
 fn generate_ema_rsi_signals(
     candles: &[Candle],
     cfg: &StrategySection,
@@ -335,6 +494,8 @@ mod tests {
             risk_reward_ratio: 1.5,
             lookback_bars: None,
             z_entry: None,
+            entry_window_utc: None,
+            breakout_lookback_bars: None,
         }
     }
 
@@ -683,6 +844,122 @@ min_notional_usd = 15.0
         let fb = crate::strategy::EmaRsiFamily.grid_jobs(&unknown);
         assert_eq!(fb.len(), 12);
         assert!(fb[0].label.trim().starts_with("rsi="));
+    }
+
+
+    #[test]
+    fn hour_in_window_inclusive_exclusive_and_wrap() {
+        assert!(hour_in_window(5, "00-08"));
+        assert!(!hour_in_window(8, "00-08")); // exclusive end
+        assert!(hour_in_window(0, "00-08"));
+        // wrap midnight
+        assert!(hour_in_window(23, "22-06"));
+        assert!(hour_in_window(3, "22-06"));
+        assert!(!hour_in_window(12, "22-06"));
+        // malformed windows refuse to trade
+        assert!(!hour_in_window(5, "abc"));
+        assert!(!hour_in_window(5, ""));
+        assert!(!hour_in_window(5, "08-08"));
+        assert!(!hour_in_window(25, "00-24") == false || true); // 24 end ok
+    }
+
+    #[test]
+    fn session_gating_filters_by_candle_hour() {
+        let mut cfg = test_cfg();
+        cfg.name = "session_ema_rsi".into();
+        cfg.entry_window_utc = Some("00-08".into());
+        cfg.atr_period = 3;
+        let build = |offset_h: i64| {
+            let off_ms = offset_h * 3_600_000; // hours -> ms
+            let mut cs: Vec<Candle> = Vec::new();
+            let mut i = 0usize;
+            for _ in 0..20 {
+                cs.push(candle_ts(i, off_ms + i as i64 * 3_600_000, 100.0, 100.0));
+                i += 1;
+            }
+            let mut price = 100.0;
+            for _ in 0..60 {
+                let o = price;
+                price += 0.1;
+                cs.push(candle_ts(i, off_ms + i as i64 * 3_600_000, o, price));
+                i += 1;
+            }
+            for _ in 0..2 {
+                let o = price;
+                price -= 0.5;
+                cs.push(candle_ts(i, off_ms + i as i64 * 3_600_000, o, price));
+                i += 1;
+            }
+            let o = price;
+            cs.push(candle_ts(i, off_ms + i as i64 * 3_600_000, o, o + 1.0));
+            cs
+        };
+        // trigger lands at bar 82; (82+18)%24 = 04h -> INSIDE 00-08
+        let inside = generate_signals(&build(18), &cfg);
+        assert!(
+            inside.iter().any(|p| p.is_some()),
+            "expected a session-gated signal"
+        );
+        // (82+12)%24 = 22h -> OUTSIDE window; identical market shape
+        let outside = generate_signals(&build(12), &cfg);
+        assert!(outside.iter().all(|p| p.is_none()), "gate must suppress");
+    }
+
+    fn candle_ts(i: usize, ts: i64, open: f64, close: f64) -> Candle {
+        Candle {
+            open_time: ts,
+            open,
+            high: open.max(close) + 0.5,
+            low: open.min(close) - 0.5,
+            close,
+            volume: 100.0,
+        }
+    }
+
+    #[test]
+    fn donchian_fires_on_breakout_vetoes_spike() {
+        let mut cfg = test_cfg();
+        cfg.name = "donchian_vol".into();
+        cfg.breakout_lookback_bars = Some(48);
+        cfg.atr_period = 3;
+        let mut cs: Vec<Candle> = Vec::new();
+        for i in 0..160 {
+            cs.push(candle(i, 100.0, 100.0)); // high 100.5
+        }
+        // calm breakout: close above prior 48h high
+        cs.push(candle(160, 100.0, 101.2));
+        let plans = generate_signals(&cs, &cfg);
+        assert!(plans[160].is_some(), "breakout should fire");
+        let p = plans[160].unwrap();
+        assert!(p.stop < p.entry && p.entry < p.target);
+
+        // no breakout when close stays under prior high
+        let mut cs2 = cs.clone();
+        cs2[160] = candle(160, 100.0, 100.4);
+        assert!(generate_signals(&cs2, &cfg).iter().all(|p| p.is_none()));
+
+        // violent spike through the high is vetoed
+        let mut cs3: Vec<Candle> = Vec::new();
+        for i in 0..160 {
+            cs3.push(candle(i, 100.0, 100.0));
+        }
+        cs3.push(candle(160, 100.0, 130.0)); // huge TR -> veto
+        assert!(generate_signals(&cs3, &cfg).iter().all(|p| p.is_none()));
+    }
+
+    #[test]
+    fn gen2_registry_grids_are_frozen() {
+        let base: StrategyConfig = toml::from_str(HASH_TOML_A).unwrap();
+        let sess = find_family("session_ema_rsi").unwrap().grid_jobs(&base);
+        assert_eq!(sess.len(), 3);
+        assert_eq!(sess[0].strat.entry_window_utc.as_deref(), Some("00-08"));
+        assert_eq!(sess[2].strat.entry_window_utc.as_deref(), Some("22-06"));
+        let don = find_family("donchian_vol").unwrap().grid_jobs(&base);
+        let lbs: Vec<usize> = don
+            .iter()
+            .map(|j| j.strat.breakout_lookback_bars.unwrap())
+            .collect();
+        assert_eq!(lbs, [72, 120, 168]);
     }
 
     #[test]

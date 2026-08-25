@@ -738,6 +738,15 @@ fn family_params(name: &str) -> Vec<(&'static str, &'static str)> {
             ("z_entry", "z_entry"),
             ("atr_multiplier", "atr_mult"),
         ],
+        "session_ema_rsi" => vec![
+            // entry window is categorical; perturb the numeric engine only
+            ("rsi_entry_threshold", "rsi_entry"),
+            ("atr_multiplier", "atr_mult"),
+        ],
+        "donchian_vol" => vec![
+            ("breakout_lookback_bars", "don_lb"),
+            ("atr_multiplier", "atr_mult"),
+        ],
         _ => vec![
             ("rsi_entry_threshold", "rsi_entry"),
             ("atr_multiplier", "atr_mult"),
@@ -759,6 +768,10 @@ fn apply_param(strat: &mut StrategySection, key: &str, mul: f64) {
         "rsi_entry_threshold" => strat.rsi_entry_threshold *= mul,
         "atr_multiplier" => strat.atr_multiplier *= mul,
         "risk_reward_ratio" => strat.risk_reward_ratio *= mul,
+        "breakout_lookback_bars" => {
+            let b = strat.breakout_lookback_bars.unwrap_or(120);
+            strat.breakout_lookback_bars = Some(((b as f64 * mul).round() as usize).max(24));
+        }
         _ => {}
     }
 }
@@ -1039,6 +1052,8 @@ mod tests {
             risk_reward_ratio: 1.5,
             lookback_bars: Some(96),
             z_entry: Some(3.0),
+            entry_window_utc: None,
+            breakout_lookback_bars: None,
         };
         let mut m = mk();
         super::apply_param(&mut m, "lookback_bars", 0.8);
