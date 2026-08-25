@@ -17,6 +17,51 @@ pub struct TradeRecord {
     /// net PnL as a fraction of entry notional (fees + slippage included)
     pub pnl_pct: f64,
     pub exit_reason: ExitReason,
+    /// best close-based excursion while held, in R multiples (risk units)
+    pub mfe_r: f64,
+    /// worst close-based excursion while held, in R multiples
+    pub mae_r: f64,
+    /// candles held including entry and exit bars
+    pub bars_held: i64,
+}
+
+/// Aggregate trade-level attribution for one simulation.
+#[derive(Debug, Clone)]
+pub struct Attribution {
+    pub avg_mfe_r: f64,
+    pub avg_mae_r: f64,
+    pub median_bars_held: f64,
+    /// 4h UTC bucket (0..=5) with the lowest summed pnl, and its sum
+    pub worst_bucket: (u8, f64),
+}
+
+/// Summarize attribution over simulated trades; None when empty.
+pub fn summarize_attribution(trades: &[TradeRecord]) -> Option<Attribution> {
+    if trades.is_empty() {
+        return None;
+    }
+    let n = trades.len() as f64;
+    let avg_mfe_r = trades.iter().map(|t| t.mfe_r).sum::<f64>() / n;
+    let avg_mae_r = trades.iter().map(|t| t.mae_r).sum::<f64>() / n;
+    let mut bars: Vec<i64> = trades.iter().map(|t| t.bars_held).collect();
+    bars.sort_unstable();
+    let median_bars_held = bars[bars.len() / 2] as f64;
+    let mut buckets = [0.0f64; 6];
+    for t in trades {
+        let hour = (t.entry_ts / 3_600_000).rem_euclid(24);
+        buckets[(hour / 4) as usize] += t.pnl;
+    }
+    let (bi, bv) = buckets
+        .iter()
+        .enumerate()
+        .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap();
+    Some(Attribution {
+        avg_mfe_r,
+        avg_mae_r,
+        median_bars_held,
+        worst_bucket: (bi as u8, *bv),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,6 +83,9 @@ struct Position {
     target: f64,
     entry_idx: usize,
     entry_fee: f64,
+    mfe_r: f64,
+    mae_r: f64,
+    bars_held: i64,
 }
 
 #[allow(dead_code)]
@@ -75,6 +123,17 @@ fn position_sizing(
 /// touched inside one candle the STOP is assumed hit first (conservative).
 pub fn run(candles: &[Candle], strat: &StrategySection, bt: &BacktestSection) -> BacktestOutput {
     let signals = generate_signals(candles, strat);
+    run_with_signals(candles, strat, bt, signals)
+}
+
+/// Same simulation with caller-supplied signals — enables attribution and
+/// permutation studies without re-running indicator math.
+pub fn run_with_signals(
+    candles: &[Candle],
+    strat: &StrategySection,
+    bt: &BacktestSection,
+    signals: Vec<Option<crate::strategy::TradePlan>>,
+) -> BacktestOutput {
     let mut trades = Vec::new();
     let mut equity_curve = Vec::new();
     let mut equity = bt.start_equity_usd;
@@ -83,7 +142,13 @@ pub fn run(candles: &[Candle], strat: &StrategySection, bt: &BacktestSection) ->
     for i in 0..candles.len() {
         let c = candles[i];
 
-        if let Some(p) = pos.take_if_in_place() {
+        if let Some(mut p) = pos.take_if_in_place() {
+            // close-based excursion tracking in R multiples (risk = entry-stop)
+            let risk_dist = p.entry_price - p.stop;
+            if risk_dist > 0.0 {
+                let r = (c.close - p.entry_price) / risk_dist;
+                pos_exc(&mut p, r);
+            }
             // exit checks on this candle (entry bar included -> gap handling)
             let exit: Option<(f64, ExitReason)> = if c.low <= p.stop {
                 Some((p.stop * (1.0 - SLIPPAGE_RATE), ExitReason::Stop))
@@ -107,6 +172,9 @@ pub fn run(candles: &[Candle], strat: &StrategySection, bt: &BacktestSection) ->
                     // and the denominator is the gross entry notional
                     pnl_pct: pnl / (p.entry_price * p.qty),
                     exit_reason: reason,
+                    mfe_r: p.mfe_r,
+                    mae_r: p.mae_r,
+                    bars_held: p.bars_held,
                 });
             } else {
                 pos = Some(p);
@@ -126,6 +194,9 @@ pub fn run(candles: &[Candle], strat: &StrategySection, bt: &BacktestSection) ->
                         target: plan.target,
                         entry_idx: i + 1,
                         entry_fee,
+                        mfe_r: 0.0,
+                        mae_r: 0.0,
+                        bars_held: 1,
                     });
                 }
             }
@@ -149,6 +220,17 @@ pub fn run(candles: &[Candle], strat: &StrategySection, bt: &BacktestSection) ->
     }
 }
 
+/// Fold a close-based R excursion into running MFE/MAE and advance hold count.
+fn pos_exc(p: &mut Position, r: f64) {
+    if r > p.mfe_r {
+        p.mfe_r = r;
+    }
+    if r < p.mae_r {
+        p.mae_r = r;
+    }
+    p.bars_held += 1;
+}
+
 // tiny helper to allow take() with condition without cloning
 trait TakeIf {
     fn take_if_in_place(&mut self) -> Option<Position>;
@@ -163,6 +245,67 @@ impl TakeIf for Option<Position> {
 mod tests {
     use super::*;
     use crate::strategy::StrategyConfig;
+
+    #[test]
+    fn attribution_tracked_in_r_multiples() {
+        // entry fills at 100 (slippage ~0 on flat opens), stop 95 => R=5.
+        // candles after entry bar: close 108 -> MFE +1.6R; close 96 -> MAE -0.8R;
+        // exit at stop on the third held candle.
+        let mut cs = Vec::new();
+        let mk = |i: usize, o: f64, h: f64, l: f64, c: f64| crate::types::Candle {
+            open_time: i as i64 * 3_600_000,
+            open: o,
+            high: h,
+            low: l,
+            close: c,
+            volume: 1.0,
+        };
+        cs.push(mk(0, 99.0, 99.5, 98.5, 99.0)); // signal bar
+        cs.push(mk(1, 100.0, 100.6, 99.4, 100.0)); // entry fills here @ ~100.05
+        cs.push(mk(2, 100.2, 108.5, 100.0, 108.0)); // held: MFE
+        cs.push(mk(3, 107.0, 107.5, 95.8, 96.0)); // held: MAE (low above stop)
+        cs.push(mk(4, 96.0, 96.5, 94.0, 94.0)); // stop hit intra-candle
+        let strat = crate::strategy::StrategySection {
+            name: "t".into(),
+            pairs: vec!["T".into()],
+            timeframe: "1h".into(),
+            ema_fast: 5,
+            ema_slow: 10,
+            rsi_period: 5,
+            rsi_entry_threshold: 40.0,
+            atr_period: 3,
+            atr_multiplier: 2.0,
+            risk_reward_ratio: 1.5,
+            lookback_bars: None,
+            z_entry: None,
+        };
+        let bt = BacktestSection {
+            start_equity_usd: 10_000.0,
+            risk_per_trade_usd: 100.0,
+            max_notional_pct_equity: 0.9,
+            min_notional_usd: 15.0,
+        };
+        let plan = Some(crate::strategy::TradePlan {
+            entry: 100.0,
+            stop: 95.0,
+            target: 110.0,
+        });
+        let sigs: Vec<Option<crate::strategy::TradePlan>> =
+            (0..cs.len()).map(|i| if i == 0 { plan } else { None }).collect();
+        // held bars: entry bar idx1 + idx2 + idx3 + exit bar idx4
+        let out = run_with_signals(&cs, &strat, &bt, sigs);
+        assert_eq!(out.trades.len(), 1);
+        let t = &out.trades[0];
+        assert!((t.entry_price - 100.0).abs() < 0.11, "fill at open+slip, got {}", t.entry_price);
+        let risk = t.entry_price - 95.0;
+        assert!(((t.mfe_r) - ((108.0 - t.entry_price) / risk)).abs() < 1e-9);
+        // exit bar close (94) is included: tracked before exit check
+        assert!(((t.mae_r) - ((94.0 - t.entry_price) / risk)).abs() < 1e-9);
+        assert_eq!(t.bars_held, 4);
+        let a = summarize_attribution(&out.trades).unwrap();
+        assert!((a.avg_mfe_r - t.mfe_r).abs() < 1e-12);
+        assert_eq!(a.median_bars_held, 4.0);
+    }
 
     const CFG_TOML: &str = include_str!("../config/strategy_ema_rsi.toml");
 

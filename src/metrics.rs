@@ -166,6 +166,9 @@ mod tests {
             exit_price: 100.0 + pnl * 100.0,
             pnl,
             pnl_pct: pnl / 10.0,
+            mfe_r: 0.0,
+            mae_r: 0.0,
+            bars_held: 1,
             exit_reason: if pnl > 0.0 {
                 ExitReason::Target
             } else {
