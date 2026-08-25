@@ -22,6 +22,10 @@ pub struct StrategySection {
     pub atr_period: usize,
     pub atr_multiplier: f64,
     pub risk_reward_ratio: f64,
+    #[serde(default)]
+    pub lookback_bars: Option<usize>,
+    #[serde(default)]
+    pub z_entry: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,6 +73,11 @@ impl StrategyConfig {
             ("start_equity_usd".into(), fx(b.start_equity_usd)),
             ("strategy_name".into(), s.name.clone()),
             ("timeframe".into(), s.timeframe.clone()),
+            (
+                "lookback_bars".into(),
+                s.lookback_bars.map(|v| v.to_string()).unwrap_or_default(),
+            ),
+            ("z_entry".into(), s.z_entry.map(fx).unwrap_or_default()),
         ];
         fields.sort(); // canonical ordering independent of TOML key order
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -148,6 +157,8 @@ mod tests {
             atr_period: 3,
             atr_multiplier: 2.0,
             risk_reward_ratio: 1.5,
+            lookback_bars: None,
+            z_entry: None,
         }
     }
 
@@ -335,5 +346,47 @@ name = "h"
                 "{name} must change the hash"
             );
         }
+    }
+
+    const HASH_TOML_ZB: &str = r#"
+[strategy]
+name = "zband_meanrev"
+pairs = ["BTCUSDT"]
+timeframe = "1h"
+lookback_bars = 48
+z_entry = 2.0
+ema_fast = 50
+ema_slow = 200
+rsi_period = 14
+rsi_entry_threshold = 35.0
+atr_period = 14
+atr_multiplier = 2.0
+risk_reward_ratio = 1.5
+
+[backtest]
+start_equity_usd = 200.0
+risk_per_trade_usd = 2.0
+max_notional_pct_equity = 0.5
+min_notional_usd = 15.0
+"#;
+
+    #[test]
+    fn zband_config_parses_with_new_fields() {
+        let c: StrategyConfig = toml::from_str(HASH_TOML_ZB).unwrap();
+        assert_eq!(c.strategy.name, "zband_meanrev");
+        assert_eq!(c.strategy.lookback_bars, Some(48));
+        assert_eq!(c.strategy.z_entry, Some(2.0));
+    }
+
+    #[test]
+    fn hash_changes_with_band_params_and_defaults_are_stable() {
+        let a: StrategyConfig = toml::from_str(HASH_TOML_A).unwrap();
+        assert_eq!(a.strategy.lookback_bars, None);
+        let mut m = a.clone();
+        m.strategy.lookback_bars = Some(48);
+        assert_ne!(a.config_hash(), m.config_hash(), "lookback must change hash");
+        let mut m = a.clone();
+        m.strategy.z_entry = Some(2.5);
+        assert_ne!(a.config_hash(), m.config_hash(), "z_entry must change hash");
     }
 }

@@ -15,6 +15,8 @@ fn fixture_cfg() -> (StrategySection, BacktestSection) {
         atr_period: 3,
         atr_multiplier: 2.0,
         risk_reward_ratio: 1.5,
+        lookback_bars: None,
+        z_entry: None,
     };
     let bt = BacktestSection {
         start_equity_usd: 200.0,

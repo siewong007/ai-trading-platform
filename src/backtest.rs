@@ -178,6 +178,8 @@ mod tests {
             atr_period: 3,
             atr_multiplier: 2.0,
             risk_reward_ratio: 1.5,
+            lookback_bars: None,
+            z_entry: None,
         }
     }
 
