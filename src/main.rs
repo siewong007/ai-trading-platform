@@ -55,6 +55,14 @@ enum Command {
         #[arg(long)]
         unlock_new_study: bool,
     },
+    /// One-at-a-time parameter neighborhood robustness (free, no budget)
+    Sensitivity {
+        #[arg(long, default_value = "config/strategy_ema_rsi.toml")]
+        config: String,
+        #[arg(long, default_value_t = 20.0)]
+        pct: f64,
+    },
+
     /// Permutation significance of a config's simulated PnL
     Permutetest {
         #[arg(long, default_value = "config/strategy_ema_rsi.toml")]
@@ -118,6 +126,9 @@ fn main() -> anyhow::Result<()> {
         Command::Fetch { config } => rt.block_on(run_fetch(&config))?,
         Command::Permutetest { config, trials } => {
             rt.block_on(run_permutetest(&config, trials))?;
+        }
+        Command::Sensitivity { config, pct } => {
+            rt.block_on(run_sensitivity(&config, pct))?;
         }
         Command::Report { md } => {
             let db = rt.block_on(Db::open_default())?;
@@ -675,6 +686,91 @@ async fn run_permutetest(config_path: &str, trials: usize) -> anyhow::Result<()>
     Ok(())
 }
 
+
+/// PLATEAU when the base config profits AND at least half its one-at-a-time
+/// neighbors also profit — an edge that dies at ±pct neighbors is curve-fit.
+fn plateau_verdict(base_pnl: f64, neighbor_pnls: &[f64]) -> &'static str {
+    if neighbor_pnls.is_empty() {
+        return "NO NEIGHBORS";
+    }
+    let positive_neighbors = neighbor_pnls.iter().filter(|&&p| p > 0.0).count();
+    if base_pnl > 0.0 && positive_neighbors * 2 >= neighbor_pnls.len() {
+        "PLATEAU"
+    } else if base_pnl > 0.0 {
+        "SPIKE (neighbors do not confirm)"
+    } else {
+        "BASE UNPROFITABLE"
+    }
+}
+
+/// Tunable params per family: (key, human label). Applied multiplicatively.
+fn family_params(name: &str) -> Vec<(&'static str, &'static str)> {
+    match name {
+        "zband_meanrev" => vec![
+            ("lookback_bars", "lookback"),
+            ("z_entry", "z_entry"),
+            ("atr_multiplier", "atr_mult"),
+        ],
+        _ => vec![
+            ("rsi_entry_threshold", "rsi_entry"),
+            ("atr_multiplier", "atr_mult"),
+            ("risk_reward_ratio", "rr"),
+        ],
+    }
+}
+
+fn apply_param(strat: &mut StrategySection, key: &str, mul: f64) {
+    match key {
+        "lookback_bars" => {
+            let b = strat.lookback_bars.unwrap_or(48);
+            strat.lookback_bars = Some(((b as f64 * mul).round() as usize).max(5));
+        }
+        "z_entry" => {
+            let z = strat.z_entry.unwrap_or(2.0);
+            strat.z_entry = Some(z * mul);
+        }
+        "rsi_entry_threshold" => strat.rsi_entry_threshold *= mul,
+        "atr_multiplier" => strat.atr_multiplier *= mul,
+        "risk_reward_ratio" => strat.risk_reward_ratio *= mul,
+        _ => {}
+    }
+}
+
+async fn run_sensitivity(config_path: &str, pct: f64) -> anyhow::Result<()> {
+    let cfg = StrategyConfig::load(config_path)?;
+    let db = Db::open_default().await?;
+    anyhow::ensure!((0.0..50.0).contains(&pct), "pct must be in [0,50)");
+    let params = family_params(&cfg.strategy.name);
+    let base_results =
+        evaluate_config(&db, &cfg.strategy, &cfg.backtest, None).await?;
+    let base_pnl: f64 = base_results
+        .iter()
+        .map(|r| r.oos_metrics.net_pnl)
+        .sum();
+    println!(
+        "SENSITIVITY (±{:.0}%, one-at-a-time; free runs, no budget charge)",
+        pct
+    );
+    println!("base aggregate OOS pnl: {base_pnl:+.2}");
+    let mut neighbors: Vec<f64> = Vec::new();
+    for (key, label) in &params {
+        for dir in [-1.0f64, 1.0] {
+            let mul = 1.0 + dir * pct / 100.0;
+            let mut s = cfg.strategy.clone();
+            apply_param(&mut s, key, mul);
+            let res = evaluate_config(&db, &s, &cfg.backtest, None).await?;
+            let pnl: f64 = res.iter().map(|r| r.oos_metrics.net_pnl).sum();
+            println!("{:<10} x{:<6} pnl {:+9.2} {}", label, mul, pnl,
+                if pnl > 0.0 { "+" } else { "-" });
+            neighbors.push(pnl);
+        }
+    }
+    println!("verdict: {} (base {:+.2}, {}/{} neighbors positive)",
+        plateau_verdict(base_pnl, &neighbors), base_pnl,
+        neighbors.iter().filter(|&&p| p > 0.0).count(), neighbors.len());
+    Ok(())
+}
+
 async fn run_backtest(config_path: &str) -> anyhow::Result<Vec<PairResult>> {
     let cfg = StrategyConfig::load(config_path)?;
     let db = Db::open_default().await?;
@@ -911,6 +1007,51 @@ async fn run_export(out: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plateau_verdict_shapes() {
+        assert_eq!(super::plateau_verdict(10.0, &[5.0, 3.0, -1.0]), "PLATEAU");
+        assert_eq!(super::plateau_verdict(10.0, &[5.0, -3.0, -1.0]),
+                   "SPIKE (neighbors do not confirm)");
+        assert_eq!(super::plateau_verdict(-2.0, &[5.0, 3.0]), "BASE UNPROFITABLE");
+        assert_eq!(super::plateau_verdict(1.0, &[]), "NO NEIGHBORS");
+    }
+
+    #[test]
+    fn apply_param_covers_both_families() {
+        use crate::strategy::StrategySection;
+        let mk = || StrategySection {
+            name: "zband_meanrev".into(),
+            pairs: vec![],
+            timeframe: "1h".into(),
+            ema_fast: 50,
+            ema_slow: 200,
+            rsi_period: 14,
+            rsi_entry_threshold: 35.0,
+            atr_period: 14,
+            atr_multiplier: 2.0,
+            risk_reward_ratio: 1.5,
+            lookback_bars: Some(96),
+            z_entry: Some(3.0),
+        };
+        let mut m = mk();
+        super::apply_param(&mut m, "lookback_bars", 0.8);
+        assert_eq!(m.lookback_bars, Some(77)); // 96*0.8=76.8 -> round 77
+        super::apply_param(&mut m, "z_entry", 1.2);
+        assert!((m.z_entry.unwrap() - 3.6).abs() < 1e-9);
+        super::apply_param(&mut m, "atr_multiplier", 1.2);
+        assert!((m.atr_multiplier - 2.4).abs() < 1e-9);
+        // legacy path with None band fields must not panic
+        let mut legacy = mk();
+        legacy.name = "ema_rsi_pullback".into();
+        legacy.lookback_bars = None;
+        legacy.z_entry = None;
+        for (k, _) in super::family_params("ema_rsi_pullback") {
+            super::apply_param(&mut legacy, k, 1.1);
+        }
+        assert!((legacy.rsi_entry_threshold - 38.5).abs() < 1e-9);
+        assert_eq!(legacy.lookback_bars, None);
+    }
 
     #[test]
     fn xorshift_deterministic_and_sample_distinct_exact() {
