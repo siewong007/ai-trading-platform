@@ -24,7 +24,8 @@ internal disk. After any config change: copy TOML into
 | com.tradingplatform.fetch | 30 min | refresh klines in **engine** DB — REQUIRED: the executor only *reads* candles; without freshness `is_stale` refuses to act |
 | com.tradingplatform.dashboard | 60 s | render `~/trading-engine/dashboard.html` (self-contained HTML, auto-refreshing tab) |
 | com.tradingplatform.tgbot | long-poll (KeepAlive) | Telegram reporter + entry/fill alert watcher (~60 s latency) |
-| com.tradingplatform.research | 6 h | measurement suite on all four families → `research_history.log`; Telegram push only on change (verdict / p-value fingerprint) |
+| com.tradingplatform.research | 6 h | measurement suite on all four families via the binary's **JSON contract** (`research_loop.py` → `research_history.log`); Telegram push only on change |
+| com.tradingplatform.oos | daily | live out-of-sample scoreboard
 | com.tradingplatform.maintenance | daily | SQLite-safe backups (14-day retention) + /tmp log rotation |
 | com.tradingplatform.oos | daily | live out-of-sample scoreboard for the frozen `session_ema_rsi` grid over the disjoint window (≥ 2026-08-26); kline-gap scan; weekly permutation refresh (`~/trading-engine/oos_scoreboard.json`) |
 
@@ -38,6 +39,14 @@ pre-registration beats adaptive tuning at taker costs).
 **Deploying code changes:** `~/trading-engine/deploy.sh` rebuilds the
 release binary, syncs all family TOMLs into the engine dir, and kickstarts
 the fetch/executor services.
+
+**Messaging architecture:** all Telegram traffic goes through one client
+path (retry ×3 w/ backoff → persistent-failure spool, 48 h redelivery).
+Non-critical pushes during 00–07 UTC quiet hours are queued into the
+morning digest; halts/fills/crash-loops always send immediately.
+Measurement commands expose `--json` for scripting — terminal tables remain
+the human default. The OOS scoreboard math lives in Rust
+(`oos-snapshot --json`, single source of truth); Python only formats.
 
 **Reporter extras:** 🌅 08:00 UTC morning digest · 🔴 crash-loop detector
 (≥4 executor restarts in 10 min) · 🟢 entry / ✅❌ fill alerts (~60 s

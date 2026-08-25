@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 use db::{BacktestRunRow, Db, TradeRow};
 use exchange::Exchange;
 use executor::{CycleOutcome, Executor};
+use serde_json::json;
 use metrics::{
     evaluate_gate, max_drawdown_pct, GateVerdict, Metrics, PairReport, GATE_MAX_VARIANTS,
 };
@@ -58,6 +59,9 @@ enum Command {
         /// measurement-only slippage override, basis points per side
         #[arg(long)]
         slip_bps: Option<f64>,
+        /// machine-readable output instead of tables
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Run the pre-declared variant grid within the 20-config budget
     Search {
@@ -79,6 +83,13 @@ enum Command {
         slip_bps: Option<f64>,
     },
 
+    /// Live out-of-sample scoreboard for the frozen session grid (JSON)
+    OosSnapshot {
+        /// permutation null trials (0 = skip null this run)
+        #[arg(long, default_value_t = 0)]
+        null_trials: usize,
+    },
+
     /// Walk-forward selection-stability across registered family grids
     Wfselect {
         #[arg(long, default_value_t = 90)]
@@ -95,6 +106,8 @@ enum Command {
         fee_bps: Option<f64>,
         #[arg(long)]
         slip_bps: Option<f64>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Dump the research ledger (budget, hashes, windows, halts)
@@ -152,11 +165,14 @@ fn main() -> anyhow::Result<()> {
         Command::Fetch { config, interval, lookback_days } => {
             rt.block_on(run_fetch(&config, interval, lookback_days))?
         }
+        Command::OosSnapshot { null_trials } => {
+            rt.block_on(run_oos_snapshot(null_trials))?;
+        }
         Command::Wfselect { quarter_days } => {
             rt.block_on(run_wfselect(quarter_days))?;
         }
-        Command::Permutetest { config, trials, fee_bps, slip_bps } => {
-            rt.block_on(run_permutetest(&config, trials, fee_bps, slip_bps))?;
+        Command::Permutetest { config, trials, fee_bps, slip_bps, json } => {
+            rt.block_on(run_permutetest(&config, trials, fee_bps, slip_bps, json))?;
         }
         Command::Sensitivity { config, pct, fee_bps, slip_bps } => {
             rt.block_on(run_sensitivity(&config, pct, fee_bps, slip_bps))?;
@@ -245,10 +261,44 @@ fn main() -> anyhow::Result<()> {
                 println!("{ledger}");
             }
         }
-        Command::Backtest { config, folds, fee_bps, slip_bps } => {
+        Command::Backtest { config, folds, fee_bps, slip_bps, json } => {
             let results = rt.block_on(run_backtest_cfg(&config, fee_bps, slip_bps))?;
-            if folds > 0 {
-                print_folds(&results, folds);
+            if json {
+                let reports: Vec<PairReport> = results
+                    .iter()
+                    .map(|r| PairReport {
+                        symbol: r.symbol.clone(),
+                        metrics: r.oos_metrics.clone(),
+                    })
+                    .collect();
+                let v = evaluate_gate(&reports);
+                let pairs: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "symbol": r.symbol,
+                            "is_n": r.is_metrics.total_trades,
+                            "is_pnl": round2(r.is_metrics.net_pnl),
+                            "oos_n": r.oos_metrics.total_trades,
+                            "oos_pf": round2_3(r.oos_metrics.profit_factor),
+                            "oos_pnl": round2(r.oos_metrics.net_pnl),
+                            "oos_dd": round2(r.oos_metrics.max_drawdown_pct),
+                        })
+                    })
+                    .collect();
+                let pnl: f64 = results.iter().map(|r| r.oos_metrics.net_pnl).sum();
+                println!("{}", serde_json::json!({
+                    "gate_pass": v.pass,
+                    "reasons": v.reasons,
+                    "total_oos_pnl": round2(pnl),
+                    "pairs": pairs,
+                }));
+            } else {
+                if folds > 0 {
+                    print_folds(&results, folds);
+                } else {
+                    print_report(&results);
+                }
             }
         }
         Command::Search {
@@ -707,11 +757,172 @@ fn aggregate_pnl(candles_by_pair: &[(String, Vec<crate::types::Candle>)],
         .sum()
 }
 
+
+/// First candle of the forward-test region: everything AFTER the data that
+/// produced the gen-2 hypothesis (docs/OOS_STUDY.md freeze memo).
+fn oos_start_ts() -> i64 {
+    use chrono::TimeZone;
+    chrono::Utc.with_ymd_and_hms(2026, 8, 26, 0, 0, 0).unwrap().timestamp_millis()
+}
+
+
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+fn round2_3(v: f64) -> f64 {
+    (v * 1000.0).round() / 1000.0
+}
+
+async fn run_oos_snapshot(null_trials: usize) -> anyhow::Result<()> {
+    let cfg = StrategyConfig::load("config/session_ema_rsi.toml")?;
+    let db = Db::open_default().await?;
+    let fam = crate::strategy::find_family(&cfg.strategy.name)
+        .ok_or_else(|| anyhow::anyhow!("family not registered"))?;
+    let oos0 = oos_start_ts();
+    let mut configs = Vec::new();
+    let mut all_oos_trades: Vec<(String, Vec<crate::backtest::TradeRecord>)> = Vec::new();
+    // per-job OOS signal slots + candles, reused by the permutation null
+    let mut jobs_sim: Vec<(
+        StrategySection,
+        Vec<(
+            Vec<crate::types::Candle>,
+            Vec<(usize, crate::strategy::TradePlan)>,
+        )>,
+    )> = Vec::new();
+    for job in fam.grid_jobs(&cfg) {
+        let mut n_tr = 0usize;
+        let mut wins = 0usize;
+        let mut pnl = 0.0;
+        let mut gw = 0.0;
+        let mut gl = 0.0;
+        let mut kept: Vec<crate::backtest::TradeRecord> = Vec::new();
+        let mut per_pair: Vec<(
+            Vec<crate::types::Candle>,
+            Vec<(usize, crate::strategy::TradePlan)>,
+        )> = Vec::new();
+        for pair in &job.strat.pairs {
+            let candles = load_series(&db, pair, &job.strat.timeframe).await?;
+            let sigs = crate::strategy::generate_signals(&candles, &job.strat);
+            for t in crate::backtest::run(&candles, &job.strat, &cfg.backtest).trades {
+                if t.entry_ts >= oos0 {
+                    n_tr += 1;
+                    wins += (t.pnl > 0.0) as usize;
+                    pnl += t.pnl;
+                    gw += t.pnl.max(0.0);
+                    gl += (-t.pnl).max(0.0);
+                    kept.push(t);
+                }
+            }
+            let sigs = crate::strategy::generate_signals(&candles, &job.strat);
+            let slots: Vec<usize> = sigs
+                .iter()
+                .enumerate()
+                .filter(|(i, p)| {
+                    p.is_some()
+                        && candles[*i].open_time >= oos0
+                        && *i + 1 < candles.len()
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let plans: Vec<(usize, crate::strategy::TradePlan)> = slots
+                .iter()
+                .filter_map(|&i| sigs[i].map(|p| (i, p)))
+                .collect();
+            per_pair.push((candles, plans));
+        }
+        jobs_sim.push((job.strat.clone(), per_pair));
+        all_oos_trades.push((job.label.clone(), kept));
+        configs.push(serde_json::json!({
+            "window": job.label,
+            "trades": n_tr,
+            "wins": wins,
+            "pnl": (pnl * 100.0).round() / 100.0,
+            "pf": if gl > 0.0 { Some((gw / gl * 1000.0).round() / 1000.0) } else { None },
+        }));
+    }
+    // kline gap scan over the last 24h (expected ~24 bars/pair)
+    let day_ago = chrono::Utc::now().timestamp_millis() - 86_400_000;
+    let mut gaps = serde_json::Map::new();
+    for pair in &cfg.strategy.pairs {
+        let n = db.count_recent_bars(pair, "1h", day_ago).await?;
+        if n < 21 {
+            gaps.insert(pair.clone(), json!(n));
+        }
+    }
+    let actual: f64 = all_oos_trades
+        .iter().flat_map(|(_, t)| t.iter()).map(|t| t.pnl).sum();
+    let mut null_val = serde_json::Value::Null;
+    if null_trials > 0 {
+        // Null: same number of entries per pair, same UTC-hour mix, but the
+        // plans are reassigned to randomly permuted OOS slots. Exits use the
+        // identical ATR/RR mechanics via run_with_signals.
+        let mut rng = 0xC0FFEEu64;
+        let mut next = move |n: usize| -> usize {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            rng = rng.wrapping_mul(0x2545F4914F6CDD1D);
+            (rng % (n as u64)) as usize
+        };
+        let mut nulls: Vec<f64> = Vec::with_capacity(null_trials);
+        for _ in 0..null_trials {
+            let mut tot = 0.0f64;
+            for (strat, per_pair) in &jobs_sim {
+                for (candles, slot_plans) in per_pair {
+                    if slot_plans.is_empty() {
+                        continue;
+                    }
+                    let k = slot_plans.len();
+                    let mut pool: Vec<usize> =
+                        slot_plans.iter().map(|&(i, _)| i).collect();
+                    for i in 0..k {
+                        let j = i + next(pool.len() - i);
+                        pool.swap(i, j);
+                    }
+                    let mut sigs: Vec<Option<crate::strategy::TradePlan>> =
+                        vec![None; candles.len()];
+                    for (pi, &dest) in pool.iter().enumerate() {
+                        sigs[dest] = Some(slot_plans[pi].1);
+                    }
+                    for t in crate::backtest::run_with_signals(
+                        candles, strat, &cfg.backtest, sigs,
+                    ).trades {
+                        tot += t.pnl;
+                    }
+                }
+            }
+            nulls.push(tot);
+        }
+        let mean = nulls.iter().sum::<f64>() / nulls.len() as f64;
+        let var = nulls.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>()
+            / nulls.len() as f64;
+        let ge = nulls.iter().filter(|&&x| x >= actual).count();
+        null_val = serde_json::json!({
+            "actual": round2(actual),
+            "null_mean": round2(mean),
+            "null_std": round2(var.sqrt()),
+            "p": round2_3(ge as f64 / nulls.len() as f64),
+            "trials": nulls.len(),
+        });
+    }
+
+    let out = serde_json::json!({
+        "generated": chrono::Utc::now().to_rfc3339(),
+        "days_elapsed": (chrono::Utc::now().timestamp_millis() - oos0) / 86_400_000,
+        "configs": configs,
+        "kline_gaps": gaps,
+        "null": null_val,
+    });
+    println!("{out}");
+    Ok(())
+}
+
 async fn run_permutetest(
     config_path: &str,
     trials: usize,
     fee_bps: Option<f64>,
     slip_bps: Option<f64>,
+    json: bool,
 ) -> anyhow::Result<()> {
     let mut cfg = StrategyConfig::load(config_path)?;
     cfg.backtest = bt_with_costs(&cfg.backtest, fee_bps, slip_bps);
@@ -770,17 +981,34 @@ async fn run_permutetest(
     let ge = null.iter().filter(|&&p| p >= actual).count();
     let mean = null.iter().sum::<f64>() / null.len() as f64;
     let var = null.iter().map(|p| (p - mean) * (p - mean)).sum::<f64>() / null.len() as f64;
-    println!("PERMUTATION TEST ({trials} trials, deterministic seed)");
-    println!("actual aggregate pnl : {actual:+.2}");
-    println!("null mean/std        : {mean:+.2} / {:.2}", var.sqrt());
-    println!("null p-value         : {}/{} = {:.3}", ge, null.len(),
-        ge as f64 / null.len() as f64);
-    println!(
-        "verdict: {}",
-        if ge == 0 { "p < 1/trials — strong evidence of edge" }
-        else if (ge as f64) / (null.len() as f64) < 0.05 { "significant at 0.05" }
-        else { "NOT distinguishable from luck" }
-    );
+    let p_val = ge as f64 / null.len() as f64;
+    let verdict = if ge == 0 {
+        "p < 1/trials — strong evidence of edge"
+    } else if p_val < 0.05 {
+        "significant at 0.05"
+    } else {
+        "NOT distinguishable from luck"
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "trials": trials,
+                "actual_pnl": round2(actual),
+                "null_mean": round2(mean),
+                "null_std": round2(var.sqrt()),
+                "ge": ge,
+                "p": round2_3(p_val),
+                "verdict": verdict,
+            })
+        );
+    } else {
+        println!("PERMUTATION TEST ({trials} trials, deterministic seed)");
+        println!("actual aggregate pnl : {actual:+.2}");
+        println!("null mean/std        : {mean:+.2} / {:.2}", var.sqrt());
+        println!("null p-value         : {}/{} = {:.3}", ge, null.len(), p_val);
+        println!("verdict: {verdict}");
+    }
     Ok(())
 }
 

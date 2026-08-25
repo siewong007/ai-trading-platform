@@ -240,6 +240,24 @@ impl Db {
         Ok(row.get::<i64, _>("n") as u32)
     }
 
+    /// Count 1h bars newer than `since_ms` for one symbol (gap scanning).
+    pub async fn count_recent_bars(
+        &self,
+        symbol: &str,
+        interval: &str,
+        since_ms: i64,
+    ) -> anyhow::Result<i64> {
+        let r = sqlx::query(
+            "SELECT COUNT(*) AS c FROM klines WHERE symbol=? AND interval=? AND open_time>?",
+        )
+        .bind(symbol)
+        .bind(interval)
+        .bind(since_ms)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(r.get::<i64, _>("c"))
+    }
+
     /// Full research ledger: budget counter, every known config hash with
     /// its per-symbol OOS results incl. window bounds, and halt day-state.
     pub async fn ledger(&self) -> anyhow::Result<serde_json::Value> {
