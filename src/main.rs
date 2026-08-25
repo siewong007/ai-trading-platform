@@ -834,21 +834,18 @@ async fn run_search(config_path: &str, unlock_new_study: bool) -> anyhow::Result
     // Pre-declared grids come from each family's frozen registration
     // (spec: ≤ 20 distinct configs EVER). Unknown family names fall back to
     // the original 12-variant ema_rsi grid — historical behavior preserved.
-    let mut jobs: Vec<(String, StrategySection)> =
+    let jobs: Vec<(String, StrategySection)> =
         match crate::strategy::find_family(&base.strategy.name) {
             Some(f) => f
                 .grid_jobs(&base)
                 .into_iter()
                 .map(|j| (j.label, j.strat))
                 .collect(),
-            None => {
-                let mut v = crate::strategy::EmaRsiFamily
-                    .grid_jobs(&base)
-                    .into_iter()
-                    .map(|j| (j.label, j.strat))
-                    .collect::<Vec<_>>();
-                v
-            }
+            None => crate::strategy::EmaRsiFamily
+                .grid_jobs(&base)
+                .into_iter()
+                .map(|j| (j.label, j.strat))
+                .collect(),
         };
 
     // Budget counts DISTINCT config hashes ever run (never resets). The
