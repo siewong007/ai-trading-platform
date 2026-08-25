@@ -22,7 +22,7 @@ use metrics::{
     evaluate_gate, max_drawdown_pct, GateVerdict, Metrics, PairReport, GATE_MAX_VARIANTS,
 };
 use signed::{Keys, SignedClient};
-use strategy::{BacktestSection, StrategyConfig, StrategySection};
+use strategy::{BacktestSection, SignalFamily, StrategyConfig, StrategySection};
 use types::Candle;
 
 #[derive(Parser)]
@@ -827,47 +827,29 @@ fn check_variant_budget(
     Ok(())
 }
 
-/// Frozen 2026-08-25 (spec §Pre-declared grid): 6 of the 8 reserved slots.
-/// Never edited after seeing any result.
-fn zband_grid() -> [(usize, f64); 6] {
-    [
-        (24, 2.0),
-        (24, 2.5),
-        (48, 2.0),
-        (48, 2.5),
-        (96, 2.0),
-        (96, 2.5),
-    ]
-}
-
 async fn run_search(config_path: &str, unlock_new_study: bool) -> anyhow::Result<()> {
     let base = StrategyConfig::load(config_path)?;
     let db = Db::open_default().await?;
 
-    // Pre-declared grids per family (spec: ≤ 20 distinct configs EVER).
-    // zband grid is FROZEN 2026-08-25 — never edited after seeing results.
-    let mut jobs: Vec<(String, StrategySection)> = Vec::new();
-    if base.strategy.name == "zband_meanrev" {
-        for (lb, z) in zband_grid() {
-            let mut s = base.strategy.clone();
-            s.lookback_bars = Some(lb);
-            s.z_entry = Some(z);
-            jobs.push((format!("lb={lb:>3} z={z}"), s));
-        }
-    } else {
-        // legacy ema_rsi_pullback grid: 2 x 3 x 2 = 12 variants (spec)
-        for rsi_e in [30.0, 35.0] {
-            for atr_m in [1.5, 2.0, 2.5] {
-                for rr in [1.5, 2.0] {
-                    let mut s = base.strategy.clone();
-                    s.rsi_entry_threshold = rsi_e;
-                    s.atr_multiplier = atr_m;
-                    s.risk_reward_ratio = rr;
-                    jobs.push((format!("rsi={rsi_e:>4} atr={atr_m:>3} rr={rr:>3}"), s));
-                }
+    // Pre-declared grids come from each family's frozen registration
+    // (spec: ≤ 20 distinct configs EVER). Unknown family names fall back to
+    // the original 12-variant ema_rsi grid — historical behavior preserved.
+    let mut jobs: Vec<(String, StrategySection)> =
+        match crate::strategy::find_family(&base.strategy.name) {
+            Some(f) => f
+                .grid_jobs(&base)
+                .into_iter()
+                .map(|j| (j.label, j.strat))
+                .collect(),
+            None => {
+                let mut v = crate::strategy::EmaRsiFamily
+                    .grid_jobs(&base)
+                    .into_iter()
+                    .map(|j| (j.label, j.strat))
+                    .collect::<Vec<_>>();
+                v
             }
-        }
-    }
+        };
 
     // Budget counts DISTINCT config hashes ever run (never resets). The
     // persisted counter is authoritative but never allowed to under-count vs
@@ -1082,15 +1064,6 @@ mod tests {
         let b2 = super::fold_bounds(0, 310, 3);
         assert_eq!(b2, vec![(0, 103), (103, 206), (206, 310)]);
         assert_eq!(super::fold_bounds(5, 5, 3), vec![]);
-    }
-
-    #[test]
-    fn zband_grid_matches_frozen_spec_exactly() {
-        let g = zband_grid();
-        assert_eq!(
-            g,
-            [(24, 2.0), (24, 2.5), (48, 2.0), (48, 2.5), (96, 2.0), (96, 2.5)]
-        );
     }
 
     #[test]

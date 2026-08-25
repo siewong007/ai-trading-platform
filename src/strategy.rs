@@ -100,14 +100,109 @@ pub struct TradePlan {
     pub target: f64,
 }
 
+/// One pre-declared variant produced by a family's frozen grid.
+#[derive(Debug, Clone)]
+pub struct FamilyGridJob {
+    pub label: String,
+    pub strat: StrategySection,
+}
+
+/// A signal family: its indicator engine plus its FROZEN pre-declared grid.
+/// Adding a future family means implementing this trait and registering it —
+/// never editing an existing family's grid after results are seen.
+pub trait SignalFamily {
+    fn name(&self) -> &'static str;
+    fn signals(&self, cfg: &StrategySection, candles: &[Candle])
+        -> Vec<Option<TradePlan>>;
+    fn grid_jobs(&self, base: &StrategyConfig) -> Vec<FamilyGridJob>;
+}
+
+pub struct EmaRsiFamily;
+pub struct ZbandFamily;
+
+impl SignalFamily for EmaRsiFamily {
+    fn name(&self) -> &'static str {
+        "ema_rsi_pullback"
+    }
+    fn signals(
+        &self,
+        cfg: &StrategySection,
+        candles: &[Candle],
+    ) -> Vec<Option<TradePlan>> {
+        generate_ema_rsi_signals(candles, cfg)
+    }
+    /// Pre-declared grid: 2 x 3 x 2 = 12 variants (spec: ≤ 20 distinct ever)
+    fn grid_jobs(&self, base: &StrategyConfig) -> Vec<FamilyGridJob> {
+        let mut v = Vec::new();
+        for rsi_e in [30.0, 35.0] {
+            for atr_m in [1.5, 2.0, 2.5] {
+                for rr in [1.5, 2.0] {
+                    let mut s = base.strategy.clone();
+                    s.rsi_entry_threshold = rsi_e;
+                    s.atr_multiplier = atr_m;
+                    s.risk_reward_ratio = rr;
+                    v.push(FamilyGridJob {
+                        label: format!("rsi={rsi_e:>4} atr={atr_m:>3} rr={rr:>3}"),
+                        strat: s,
+                    });
+                }
+            }
+        }
+        v
+    }
+}
+
+impl SignalFamily for ZbandFamily {
+    fn name(&self) -> &'static str {
+        "zband_meanrev"
+    }
+    fn signals(
+        &self,
+        cfg: &StrategySection,
+        candles: &[Candle],
+    ) -> Vec<Option<TradePlan>> {
+        generate_zband_signals(candles, cfg)
+    }
+    /// Frozen 2026-08-25 (spec §Pre-declared grid): 6 of the 8 reserved slots.
+    /// Never edited after seeing any result.
+    fn grid_jobs(&self, base: &StrategyConfig) -> Vec<FamilyGridJob> {
+        const FROZEN: [(usize, f64); 6] = [
+            (24, 2.0),
+            (24, 2.5),
+            (48, 2.0),
+            (48, 2.5),
+            (96, 2.0),
+            (96, 2.5),
+        ];
+        FROZEN
+            .iter()
+            .map(|&(lb, z)| {
+                let mut s = base.strategy.clone();
+                s.lookback_bars = Some(lb);
+                s.z_entry = Some(z);
+                FamilyGridJob {
+                    label: format!("lb={lb:>3} z={z}"),
+                    strat: s,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Registry lookup; None for unknown family names.
+pub fn find_family(name: &str) -> Option<&'static dyn SignalFamily> {
+    const REGISTRY: &[&dyn SignalFamily] = &[&EmaRsiFamily, &ZbandFamily];
+    REGISTRY.iter().copied().find(|f| f.name() == name)
+}
+
 /// Evaluate strategy over a closed-candle series.
 /// Output[i] = Some(plan) when a long entry triggers on candle i's close.
-/// Family dispatcher: strategy TOML selects the signal engine by name.
+/// Family dispatcher: strategy TOML selects the signal engine by name;
+/// unknown names fall back to the original EMA/RSI engine.
 pub fn generate_signals(candles: &[Candle], cfg: &StrategySection) -> Vec<Option<TradePlan>> {
-    if cfg.name == "zband_meanrev" {
-        generate_zband_signals(candles, cfg)
-    } else {
-        generate_ema_rsi_signals(candles, cfg)
+    match find_family(&cfg.name) {
+        Some(f) => f.signals(cfg, candles),
+        None => generate_ema_rsi_signals(candles, cfg),
     }
 }
 
@@ -556,6 +651,38 @@ min_notional_usd = 15.0
         cs.push(candle(110, 100.0, 90.0));
         let plans = generate_signals(&cs, &cfg);
         assert!(plans[..106].iter().all(|p| p.is_none()));
+    }
+
+    #[test]
+    fn zband_registry_grid_is_frozen_exactly() {
+        let base: StrategyConfig = toml::from_str(HASH_TOML_ZB).unwrap();
+        let jobs = find_family("zband_meanrev").unwrap().grid_jobs(&base);
+        let got: Vec<(usize, f64)> = jobs
+            .iter()
+            .map(|j| (j.strat.lookback_bars.unwrap(), j.strat.z_entry.unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            [(24, 2.0), (24, 2.5), (48, 2.0), (48, 2.5), (96, 2.0), (96, 2.5)]
+        );
+        assert!(jobs.iter().all(|j| j.label.starts_with("lb=")));
+    }
+
+    #[test]
+    fn legacy_grid_and_fallback_are_unchanged() {
+        let base: StrategyConfig = toml::from_str(HASH_TOML_A).unwrap();
+        // registered ema_rsi family
+        assert_eq!(
+            find_family("ema_rsi_pullback").unwrap().grid_jobs(&base).len(),
+            12
+        );
+        // unknown family name falls back to the 12-variant grid
+        let mut unknown = base.clone();
+        unknown.strategy.name = "mystery".into();
+        assert!(find_family("mystery").is_none());
+        let fb = crate::strategy::EmaRsiFamily.grid_jobs(&unknown);
+        assert_eq!(fb.len(), 12);
+        assert!(fb[0].label.trim().starts_with("rsi="));
     }
 
     #[test]
