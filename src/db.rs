@@ -249,7 +249,7 @@ impl Db {
             .unwrap_or_else(|| "0".into());
         let rows = sqlx::query(
             "SELECT config_hash,symbol,rsi_entry,atr_mult,rr,lookback_bars,z_entry,\
-             oos_start_ts,oos_end_ts,oos_trades,oos_pf,oos_pnl,oos_dd,ran_at\
+             oos_start_ts,oos_end_ts,oos_trades,oos_pf,oos_pnl,oos_dd,ran_at \
              FROM backtest_runs ORDER BY config_hash,symbol",
         )
         .fetch_all(&self.pool)
