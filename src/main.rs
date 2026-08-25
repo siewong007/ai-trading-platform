@@ -387,7 +387,7 @@ async fn run_fetch(
         } else {
             0
         };
-        db.upsert_klines(pair, &tf, &ks).await?
+        db.upsert_klines(pair, &tf, &ks).await?;
         tracing::info!("{pair}: cached {} candles (~{span_days} days)", ks.len());
     }
     Ok(())
