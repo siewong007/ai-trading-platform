@@ -37,13 +37,22 @@ Testnet-first: `trade` defaults to `https://testnet.binance.vision`.
 
 | Command | Purpose |
 |---|---|
-| `fetch` | cache ~18 months of 1h klines per configured pair |
-| `backtest` | one config: IS/OOS report + gate verdict |
+| `fetch [--interval TF] [--lookback-days N]` | cache klines (default ~18 months 1h; deep research: `--lookback-days 2200`) |
+| `backtest [--folds K]` | IS/OOS report + gate verdict + attribution + fold stability |
 | `search [--unlock-new-study]` | replay the known grid; new hashes locked |
+| `sensitivity [--pct P]` | one-at-a-time parameter plateau analysis (free, no budget) |
+| `permutetest --trials N` | significance vs shuffled-entry null distribution |
+| `report [--md]` | research ledger dump (budget, hashes, windows, halts) |
 | `export --out FILE.csv` | trades table → CSV (tax records) |
 | `trade [--once] [--dry-run] [--testnet\|--live]` | executor loop (testnet default; `--live` requires stored PASS then `GO`) |
 | `flatten` | kill switch: cancel all → confirm → market-reduce → verify |
 | `scripts/lab.sh` | lab tech: `fetch` + `backtest` only (no search, no trade, no LLM) |
+
+Families are pluggable via the `SignalFamily` registry
+(`src/strategy.rs`): each registers its signal engine and its FROZEN
+pre-declared grid. Registered today: `ema_rsi_pullback` (12 variants),
+`zband_meanrev` (6 reserved slots). Autonomous deployment guide:
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Quickstart
 
