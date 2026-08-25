@@ -78,6 +78,26 @@ pub fn atr(highs: &[f64], lows: &[f64], closes: &[f64], period: usize) -> Vec<Op
     out
 }
 
+/// Rolling arithmetic mean and POPULATION standard deviation over a trailing
+/// window of `period` values. Valid from index `period-1`; earlier entries
+/// (and short inputs) are None.
+pub fn rolling_stats(values: &[f64], period: usize) -> (Vec<Option<f64>>, Vec<Option<f64>>) {
+    let n = values.len();
+    let mut means: Vec<Option<f64>> = vec![None; n];
+    let mut stds: Vec<Option<f64>> = vec![None; n];
+    if period == 0 || n < period {
+        return (means, stds);
+    }
+    for i in (period - 1)..n {
+        let w = &values[i + 1 - period..=i];
+        let mean = w.iter().sum::<f64>() / period as f64;
+        let var = w.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / period as f64;
+        means[i] = Some(mean);
+        stds[i] = Some(var.sqrt());
+    }
+    (means, stds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +178,34 @@ mod tests {
     fn short_input_yields_none() {
         assert!(ema(&[1.0, 2.0], 3).iter().all(|v| v.is_none()));
         assert!(rsi(&[1.0, 2.0], 14).iter().all(|v| v.is_none()));
+    }
+
+    #[test]
+    fn rolling_stats_hand_computed() {
+        // windows of 3 ending at idx 2..4 over [1,2,3,4,5]
+        // means: 2, 3, 4 ; population sigma: sqrt(2/3) each (deviations ±1,0)
+        let (m, s) = rolling_stats(&[1.0, 2.0, 3.0, 4.0, 5.0], 3);
+        assert_eq!(m[0], None);
+        assert_eq!(m[1], None);
+        assert!(approx(m[2].unwrap(), 2.0));
+        assert!(approx(m[3].unwrap(), 3.0));
+        assert!(approx(m[4].unwrap(), 4.0));
+        let want = (2.0f64 / 3.0).sqrt();
+        assert!(approx(s[2].unwrap(), want));
+        assert!(approx(s[4].unwrap(), want));
+    }
+
+    #[test]
+    fn rolling_stats_constant_series_zero_sigma() {
+        let (m, s) = rolling_stats(&[5.0; 4], 3);
+        assert!(approx(m[2].unwrap(), 5.0));
+        assert!(approx(s[2].unwrap(), 0.0));
+    }
+
+    #[test]
+    fn rolling_stats_short_input_all_none() {
+        let (m, s) = rolling_stats(&[1.0, 2.0], 3);
+        assert!(m.iter().all(|v| v.is_none()));
+        assert!(s.iter().all(|v| v.is_none()));
     }
 }
