@@ -458,6 +458,13 @@ async fn run_trade(config_path: &str, base: &str, dry_run: bool, once: bool) -> 
         cycle += 1;
         match ex.run_cycle(now_ms()).await {
             Ok(outcome) => {
+                // action confirmations: one push per completed trading action
+                if let CycleOutcome::PlacedOco { list_id } = &outcome {
+                    crate::notify(&format!(
+                        "🛡️ <b>PROTECTION ARMED</b> — OCO live on-exchange\nlist <code>{list_id}</code> · TP/SL legs active"
+                    ))
+                    .await;
+                }
                 let open = matches!(
                     outcome,
                     CycleOutcome::PlacedEntry { .. }
