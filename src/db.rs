@@ -240,6 +240,31 @@ impl Db {
         Ok(row.get::<i64, _>("n") as u32)
     }
 
+    /// Persist one closed trade (live stopout/target exits).
+    pub async fn record_closed_trade(&self, r: &TradeRow) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO trades(client_order_id,symbol,side,qty,entry_price,entry_ts,\
+             exit_price,exit_ts,fee_paid,pnl,pnl_pct,strategy,mode)\
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(r.client_order_id.as_deref())
+        .bind(&r.symbol)
+        .bind(&r.side)
+        .bind(r.qty)
+        .bind(r.entry_price)
+        .bind(r.entry_ts)
+        .bind(r.exit_price)
+        .bind(r.exit_ts)
+        .bind(r.fee_paid)
+        .bind(r.pnl)
+        .bind(r.pnl_pct)
+        .bind(&r.strategy)
+        .bind(&r.mode)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Count 1h bars newer than `since_ms` for one symbol (gap scanning).
     pub async fn count_recent_bars(
         &self,

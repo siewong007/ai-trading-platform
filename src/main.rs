@@ -403,7 +403,7 @@ async fn telegram_send(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn notify(text: &str) {
+pub(crate) async fn notify(text: &str) {
     if std::env::var("TELEGRAM_BOT_TOKEN").is_err() || std::env::var("TELEGRAM_CHAT_ID").is_err() {
         return;
     }

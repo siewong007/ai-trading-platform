@@ -273,6 +273,36 @@ impl Executor {
                 let mut day = load_day_state(&self.db, &self.hash).await?;
                 register_result(&mut day, pnl, was_stopout);
                 store_day_state(&self.db, &self.hash, &day).await?;
+                // persist the closed trade so /pnl, dashboard and exports see it
+                let row = crate::db::TradeRow {
+                    id: 0,
+                    client_order_id: Some(format!(
+                        "close-{}-{}",
+                        base_asset(pair.as_str())?,
+                        pos.opened_ts
+                    )),
+                    symbol: pair.clone(),
+                    side: "SELL".into(),
+                    qty: exit_qty,
+                    entry_price: pos.entry_price,
+                    entry_ts: pos.opened_ts,
+                    exit_price: Some(avg_exit),
+                    exit_ts: exits.last().map(|t| t.time),
+                    fee_paid: fees,
+                    pnl: Some(pnl),
+                    pnl_pct: Some(pnl / (pos.entry_price * exit_qty)),
+                    strategy: self.strat.name.clone(),
+                    mode: "live".into(),
+                };
+                if let Err(e) = self.db.record_closed_trade(&row).await {
+                    tracing::error!("failed to persist closed trade: {e:#}");
+                }
+                let emoji = if was_stopout { "🛑" } else { "🎯" };
+                let how = if was_stopout { "STOP hit 🛑" } else { "TARGET hit 🎯" };
+                crate::notify(&format!(
+                    "{emoji} <b>TRADE CLOSED</b> — {pair}\n\nexit <code>{avg_exit:.6}</code> · PnL <code>{pnl:+.4} USDT</code> · exit via {how}"
+                ))
+                .await;
                 self.clear_pos().await?;
                 tracing::info!("{pair}: position closed pnl={pnl:.4} stopout={was_stopout}");
                 Ok(CycleOutcome::Flat)
