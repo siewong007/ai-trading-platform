@@ -375,6 +375,10 @@ impl SignedClient {
                     ("belowStopPrice", stop.as_str()),
                     ("belowPrice", below.as_str()),
                     ("listClientOrderId", list_client_id),
+                    // deterministic per-leg ids let reconciliation recognize
+                    // its own protection legs among open orders
+                    ("aboveClientOrderId", format!("{list_client_id}-a").as_str()),
+                    ("belowClientOrderId", format!("{list_client_id}-b").as_str()),
                 ],
             )
             .await?;
