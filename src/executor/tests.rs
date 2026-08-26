@@ -154,7 +154,7 @@ async fn flat_series_yields_no_signal_and_no_orders() {
         .await
         .unwrap()
         .into_iter()
-        .filter(|r| r.url.path() == "/api/v3/order" || r.url.path() == "/api/v3/order/oco")
+        .filter(|r| r.url.path() == "/api/v3/order" || r.url.path() == "/api/v3/orderList/oco")
         .count();
     assert_eq!(orders, 0);
 }
@@ -286,12 +286,13 @@ async fn filled_entry_places_oco_with_exact_legs() {
         .mount(&server)
         .await;
     let oco_mock = Mock::given(method("POST"))
-        .and(path("/api/v3/order/oco"))
+        .and(path("/api/v3/orderList/oco"))
         .and(query_param("aboveType", "LIMIT_MAKER"))
         .and(query_param("abovePrice", fmt_price(108.0).as_str()))
         .and(query_param("belowStopPrice", fmt_price(103.0).as_str()))
         .and(query_param("belowPrice", fmt_price(103.0 * 0.995).as_str()))
         .and(query_param("belowType", "STOP_LOSS_LIMIT"))
+        .and(query_param("belowTimeInForce", "GTC"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "orderListId": 777
         })))
@@ -449,7 +450,7 @@ async fn reconcile_places_oco_for_filled_unprotected_entry() {
         .mount(&server)
         .await;
     let oco_mock = Mock::given(method("POST"))
-        .and(path("/api/v3/order/oco"))
+        .and(path("/api/v3/orderList/oco"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(serde_json::json!({"orderListId": 888})),
         )
@@ -674,7 +675,7 @@ async fn dry_run_never_places_recovery_oco() {
     mount_account_filters(&server).await;
     // any POST /order/oco would be a real order — forbid it
     Mock::given(method("POST"))
-        .and(path("/api/v3/order/oco"))
+        .and(path("/api/v3/orderList/oco"))
         .respond_with(ResponseTemplate::new(500).set_body_string("dry-run must not place"))
         .expect(0)
         .mount(&server)
@@ -709,7 +710,7 @@ async fn protection_missing_re_arms_oco_for_remaining_size() {
         .await;
     mount_account_filters(&server).await;
     let oco_mock = Mock::given(method("POST"))
-        .and(path("/api/v3/order/oco"))
+        .and(path("/api/v3/orderList/oco"))
         .and(query_param("quantity", "0.6"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(serde_json::json!({"orderListId": 999})),

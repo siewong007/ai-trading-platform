@@ -350,8 +350,9 @@ impl SignedClient {
         stop_price: f64,
         list_client_id: &str,
     ) -> anyhow::Result<String> {
-        // legacy OCO requires top-level `price` + `stopPrice`; legs must be
-        // on the symbol's tick grid or the exchange answers -1013
+        // Modern orderList OCO — contract verified live on testnet 2026-08-26:
+        // per-leg types/prices + mandatory belowTimeInForce. All prices must
+        // sit on the symbol's tick grid or the exchange answers -1013.
         let f = Self::symbol_filters(self.base.as_str(), symbol).await?;
         let tp_r = round_price_to_tick(tp_price, f.tick_size);
         let stop_r = round_price_to_tick(stop_price, f.tick_size);
@@ -359,19 +360,21 @@ impl SignedClient {
         let qty_str = fmt_price(qty_r);
         let tp = fmt_price(tp_r);
         let stop = fmt_price(stop_r);
+        let below = fmt_price(round_price_to_tick(stop_r * 0.995, f.tick_size));
         let body = self
             .signed_post(
-                "/api/v3/order/oco",
+                "/api/v3/orderList/oco",
                 &[
                     ("symbol", symbol),
                     ("side", "SELL"),
                     ("quantity", qty_str.as_str()),
-                    ("price", tp.as_str()),
-                    ("stopPrice", stop.as_str()),
-                    ("listClientOrderId", list_client_id),
                     ("aboveType", "LIMIT_MAKER"),
+                    ("abovePrice", tp.as_str()),
                     ("belowType", "STOP_LOSS_LIMIT"),
+                    ("belowTimeInForce", "GTC"),
                     ("belowStopPrice", stop.as_str()),
+                    ("belowPrice", below.as_str()),
+                    ("listClientOrderId", list_client_id),
                 ],
             )
             .await?;
@@ -1099,16 +1102,17 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/api/v3/order/oco"))
+            .and(path("/api/v3/orderList/oco"))
             .and(query_param("symbol", "BTCUSDT"))
             .and(query_param("side", "SELL"))
             .and(query_param("quantity", "0.01"))
             .and(query_param("aboveType", "LIMIT_MAKER"))
             .and(query_param("abovePrice", "101.5"))
             .and(query_param("belowType", "STOP_LOSS_LIMIT"))
+            .and(query_param("belowTimeInForce", "GTC"))
             .and(query_param("belowStopPrice", "98.25"))
-            .and(query_param("price", "101.5"))
-            .and(query_param("stopPrice", "98.25"))
+            .and(query_param("abovePrice", "101.5"))
+            .and(query_param("belowTimeInForce", "GTC"))
             .and(query_param("listClientOrderId", "tp-oco-1700"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"orderListId":12345,"contingencyType":"OCO","listStatusType":"EXEC_STARTED",
@@ -1127,7 +1131,7 @@ mod tests {
         let reqs = server.received_requests().await.unwrap();
         let post = reqs
             .iter()
-            .find(|r| r.method == "POST" && r.url.path() == "/api/v3/order/oco")
+            .find(|r| r.method == "POST" && r.url.path() == "/api/v3/orderList/oco")
             .expect("oco request recorded");
         let query = post.url.query().unwrap();
         assert!(
