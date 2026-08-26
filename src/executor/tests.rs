@@ -76,7 +76,7 @@ async fn memory_db() -> Db {
 
 const ACCOUNT_JSON: &str = r#"{"canTrade":true,"balances":[{"asset":"USDT","free":"200.00000000","locked":"0.00000000"},{"asset":"TEST","free":"0.00000000","locked":"0.00000000"}]}"#;
 
-const EXCHANGE_INFO_JSON: &str = r#"{"symbols":[{"symbol":"TESTUSDT","status":"TRADING","filters":[{"filterType":"LOT_SIZE","stepSize":"0.00100000","minQty":"0.00100000"},{"filterType":"NOTIONAL","minNotional":"5.00000000"}]}]}"#;
+const EXCHANGE_INFO_JSON: &str = r#"{"symbols":[{"symbol":"TESTUSDT","status":"TRADING","filters":[{"filterType":"LOT_SIZE","stepSize":"0.00100000","minQty":"0.00100000"},{"filterType":"PRICE_FILTER","tickSize":"0.00010000"},{"filterType":"NOTIONAL","minNotional":"5.00000000"}]}]}"#;
 
 async fn mount_account_filters(server: &MockServer) {
     Mock::given(method("GET"))

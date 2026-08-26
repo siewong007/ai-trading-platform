@@ -45,6 +45,7 @@ pub struct SymbolFilters {
     pub step_size: f64,
     pub min_qty: f64,
     pub min_notional: f64,
+    pub tick_size: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +114,14 @@ pub struct OrderSpec {
     pub limit_price: f64,
     pub tif: TimeInForce,
     pub instruction: ExecInstruction,
+}
+
+/// Floor a price onto the symbol's tick grid (Binance rejects off-grid prices).
+pub fn round_price_to_tick(price: f64, tick_size: f64) -> f64 {
+    if tick_size <= 0.0 || !price.is_finite() || price <= 0.0 {
+        return price;
+    }
+    ((price / tick_size).floor() * tick_size * 1e8).round() / 1e8
 }
 
 pub fn round_qty_to_step(qty: f64, step_size: f64) -> f64 {
@@ -251,6 +260,7 @@ impl SignedClient {
         let mut min_qty = None;
         let mut notional = None;
         let mut legacy_notional = None;
+        let mut tick_size = None;
         for f in sym.filters {
             match f {
                 RawFilter::LotSize {
@@ -264,10 +274,12 @@ impl SignedClient {
                 RawFilter::LegacyMinNotional { min_notional } => {
                     legacy_notional = Some(min_notional)
                 }
+                RawFilter::PriceFilter { tick_size: t } => tick_size = Some(t.parse()?),
                 RawFilter::Other => {}
             }
         }
         let no_lot = || anyhow::anyhow!("exchangeInfo {symbol}: no LOT_SIZE filter");
+        let no_tick = || anyhow::anyhow!("exchangeInfo {symbol}: no PRICE_FILTER filter");
         let min_notional = notional.or(legacy_notional).ok_or_else(|| {
             anyhow::anyhow!("exchangeInfo {symbol}: no NOTIONAL/MIN_NOTIONAL filter")
         })?;
@@ -275,6 +287,7 @@ impl SignedClient {
             step_size: step_size.ok_or_else(no_lot)?,
             min_qty: min_qty.ok_or_else(no_lot)?,
             min_notional: min_notional.parse()?,
+            tick_size: tick_size.ok_or_else(no_tick)?,
         })
     }
 
@@ -337,10 +350,16 @@ impl SignedClient {
         stop_price: f64,
         list_client_id: &str,
     ) -> anyhow::Result<String> {
-        let qty_str = fmt_price(qty);
-        let tp = fmt_price(tp_price);
-        let stop = fmt_price(stop_price);
-        let below = fmt_price((stop_price * 0.995 * 1e8).round() / 1e8);
+        // legacy OCO requires top-level `price` + `stopPrice`; legs must be
+        // on the symbol's tick grid or the exchange answers -1013
+        let f = Self::symbol_filters(self.base.as_str(), symbol).await?;
+        let tp_r = round_price_to_tick(tp_price, f.tick_size);
+        let stop_r = round_price_to_tick(stop_price, f.tick_size);
+        let qty_r = crate::signed::round_qty_to_step(qty, f.step_size);
+        let qty_str = fmt_price(qty_r);
+        let tp = fmt_price(tp_r);
+        let stop = fmt_price(stop_r);
+        let below = fmt_price(round_price_to_tick(stop_r * 0.995, f.tick_size));
         let body = self
             .signed_post(
                 "/api/v3/order/oco",
@@ -348,6 +367,8 @@ impl SignedClient {
                     ("symbol", symbol),
                     ("side", "SELL"),
                     ("quantity", qty_str.as_str()),
+                    ("price", tp.as_str()),
+                    ("stopPrice", stop.as_str()),
                     ("listClientOrderId", list_client_id),
                     ("aboveType", "LIMIT_MAKER"),
                     ("abovePrice", tp.as_str()),
@@ -625,6 +646,11 @@ enum RawFilter {
         #[serde(rename = "minNotional")]
         min_notional: String,
     },
+    #[serde(rename = "PRICE_FILTER")]
+    PriceFilter {
+        #[serde(rename = "tickSize")]
+        tick_size: String,
+    },
     #[serde(other)]
     Other,
 }
@@ -862,11 +888,11 @@ mod tests {
         let modern = r#"{"timezone":"UTC","serverTime":1700000000000,"symbols":[{"symbol":"BTCUSDT",
             "status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","filters":[
             {"filterType":"PRICE_FILTER","tickSize":"0.01000000"},
-            {"filterType":"LOT_SIZE","minQty":"0.00010000","maxQty":"9000.00000000","stepSize":"0.00010000"},
+            {"filterType":"LOT_SIZE","minQty":"0.00010000","maxQty":"9000.00000000","stepSize":"0.00010000"},{"filterType":"PRICE_FILTER","tickSize":"0.00010000"},
             {"filterType":"NOTIONAL","minNotional":"10.00000000","applyMinToMarket":true,
              "maxNotional":null,"applyMaxToMarket":false,"avgPriceMins":5}]}]}"#;
         let legacy = r#"{"symbols":[{"symbol":"ETHBTC","status":"TRADING","filters":[
-            {"filterType":"LOT_SIZE","minQty":"0.00100000","maxQty":"100.00000000","stepSize":"0.00100000"},
+            {"filterType":"LOT_SIZE","minQty":"0.00100000","maxQty":"100.00000000","stepSize":"0.00100000"},{"filterType":"PRICE_FILTER","tickSize":"0.00010000"},
             {"filterType":"MIN_NOTIONAL","minNotional":"0.00010000","applyToMarket":true,
              "avgPriceMins":5}]}]}"#;
         for (body, symbol, step, min_qty, min_notional) in [
@@ -896,7 +922,7 @@ mod tests {
             .and(path("/api/v3/exchangeInfo"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"symbols":[{"symbol":"BTCUSDT","filters":[
-                    {"filterType":"LOT_SIZE","minQty":"0.00010000","stepSize":"0.00010000"},
+                    {"filterType":"LOT_SIZE","minQty":"0.00010000","stepSize":"0.00010000"},{"filterType":"PRICE_FILTER","tickSize":"0.00010000"},
                     {"filterType":"NOTIONAL","minNotional":"10.00000000"}]}]}"#,
             ))
             .mount(&server)
@@ -1063,6 +1089,18 @@ mod tests {
     #[tokio::test]
     async fn place_oco_sell_sends_exact_legs_and_returns_list_id() {
         let server = MockServer::start().await;
+        // place_oco_sell resolves live filters before submitting
+        Mock::given(method("GET"))
+            .and(path("/api/v3/exchangeInfo"))
+            .and(query_param("symbol", "BTCUSDT"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","filters":[
+                {"filterType":"PRICE_FILTER","tickSize":"0.00010000"},
+                {"filterType":"LOT_SIZE","minQty":"0.00010000","stepSize":"0.00010000"},
+                {"filterType":"NOTIONAL","minNotional":"10.00000000"}]}]}"#,
+            ))
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/api/v3/order/oco"))
             .and(query_param("symbol", "BTCUSDT"))
@@ -1072,7 +1110,9 @@ mod tests {
             .and(query_param("abovePrice", "101.5"))
             .and(query_param("belowType", "STOP_LOSS_LIMIT"))
             .and(query_param("belowStopPrice", "98.25"))
-            .and(query_param("belowPrice", "97.75875"))
+            .and(query_param("price", "101.5"))
+            .and(query_param("stopPrice", "98.25"))
+            .and(query_param("belowPrice", "97.7587"))
             .and(query_param("listClientOrderId", "tp-oco-1700"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"orderListId":12345,"contingencyType":"OCO","listStatusType":"EXEC_STARTED",
@@ -1089,7 +1129,11 @@ mod tests {
         assert_eq!(list_id, "12345");
 
         let reqs = server.received_requests().await.unwrap();
-        let query = reqs[0].url.query().unwrap();
+        let post = reqs
+            .iter()
+            .find(|r| r.method == "POST" && r.url.path() == "/api/v3/order/oco")
+            .expect("oco request recorded");
+        let query = post.url.query().unwrap();
         assert!(
             !query.contains("e-") && !query.contains("e+"),
             "prices must be formatted without exponent notation: {query}"

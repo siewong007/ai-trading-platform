@@ -157,6 +157,7 @@ mod tests {
             step_size: step,
             min_qty: 0.0,
             min_notional: 10.0,
+            tick_size: 0.01,
         }
     }
 
