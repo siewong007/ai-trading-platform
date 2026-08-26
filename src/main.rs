@@ -412,7 +412,28 @@ async fn notify(text: &str) {
     }
 }
 
+/// Alert dedup key: strip cycle numbers so identical recurring failures
+/// collapse into one push; a genuinely different error re-alerts instantly.
+fn alert_key(err: &str) -> String {
+    let mut out = String::new();
+    let mut prev_digit = false;
+    for ch in err.chars() {
+        if ch.is_ascii_digit() {
+            if !prev_digit {
+                out.push('#');
+            }
+            prev_digit = true;
+        } else {
+            out.push(ch);
+            prev_digit = false;
+        }
+    }
+    out.trim().to_string()
+}
+
 async fn run_trade(config_path: &str, base: &str, dry_run: bool, once: bool) -> anyhow::Result<()> {
+    let mut last_err_alert: Option<String> = None;
+    let mut had_error = false;
     let cfg = StrategyConfig::load(config_path)?;
     let db = Db::open_default().await?;
     let verdict = db.latest_search_overall_verdict().await?;
@@ -448,13 +469,31 @@ async fn run_trade(config_path: &str, base: &str, dry_run: bool, once: bool) -> 
                     "heartbeat alive cycle={cycle} pos={}",
                     if open { "open" } else { "flat" }
                 );
+                if had_error {
+                    notify(&format!(
+                        "✅ recovered — cycle {cycle} succeeded after error streak"
+                    ))
+                    .await;
+                    had_error = false;
+                    last_err_alert = None;
+                }
                 if once {
                     break;
                 }
             }
             Err(e) => {
                 tracing::error!("cycle {cycle} failed: {e:#}");
-                notify(&format!("trade cycle {cycle} error: {e:#}")).await;
+                had_error = true;
+                let msg = format!("{e:#}");
+                let key = alert_key(&msg);
+                if last_err_alert.as_deref() != Some(key.as_str()) {
+                    // first occurrence of this signature — alert with context
+                    notify(&format!(
+                        "⛔ trade cycle {cycle} error: {msg}\n(recurring occurrences silenced)"
+                    ))
+                    .await;
+                    last_err_alert = Some(key);
+                }
             }
         }
         let day = risk::load_day_state(&ex.db, &ex.hash).await?;
@@ -1501,6 +1540,21 @@ mod tests {
         assert_eq!(uniq.len(), 10, "sampled indices must be distinct");
         assert!(s1.iter().all(|&i| i < 100));
         assert_eq!(r.sample_distinct(5, 99).len(), 5, "k clamped to n");
+    }
+
+    #[test]
+    fn alert_key_collapses_cycle_numbers_but_keeps_error_identity() {
+        let a1 = super::alert_key("cycle 1120 failed: binance error -1102: bad");
+        let a2 = super::alert_key("cycle 1121 failed: binance error -1102: bad");
+        assert_eq!(a1, a2, "same error, different cycle -> same key");
+
+        let b = super::alert_key("cycle 1122 failed: binance error -2010: dup");
+        assert_ne!(a1, b, "different error -> different key");
+
+        // positional numbers that are part of the message stay intact
+        let c1 = super::alert_key("XRPUSDT qty 45.7 below min");
+        let c2 = super::alert_key("BTCUSDT qty 45.7 below min");
+        assert_ne!(c1, c2);
     }
 
     #[test]
