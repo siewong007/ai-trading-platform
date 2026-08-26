@@ -359,7 +359,6 @@ impl SignedClient {
         let qty_str = fmt_price(qty_r);
         let tp = fmt_price(tp_r);
         let stop = fmt_price(stop_r);
-        let below = fmt_price(round_price_to_tick(stop_r * 0.995, f.tick_size));
         let body = self
             .signed_post(
                 "/api/v3/order/oco",
@@ -371,10 +370,8 @@ impl SignedClient {
                     ("stopPrice", stop.as_str()),
                     ("listClientOrderId", list_client_id),
                     ("aboveType", "LIMIT_MAKER"),
-                    ("abovePrice", tp.as_str()),
                     ("belowType", "STOP_LOSS_LIMIT"),
                     ("belowStopPrice", stop.as_str()),
-                    ("belowPrice", below.as_str()),
                 ],
             )
             .await?;
@@ -1112,7 +1109,6 @@ mod tests {
             .and(query_param("belowStopPrice", "98.25"))
             .and(query_param("price", "101.5"))
             .and(query_param("stopPrice", "98.25"))
-            .and(query_param("belowPrice", "97.7587"))
             .and(query_param("listClientOrderId", "tp-oco-1700"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"orderListId":12345,"contingencyType":"OCO","listStatusType":"EXEC_STARTED",
